@@ -12,14 +12,18 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <limits>
+#include <set>
+#include <unordered_map>
 
 #include "planner/extract/extractor.hpp"
+#include "test_support/extract.hpp"
 
 import memgraph.planner.core.egraph;
 
 using namespace memgraph::planner::core;
 using namespace memgraph::planner::core::extract;
+using memgraph::planner::test_support::DefaultCostResult;
+using memgraph::planner::test_support::DefaultResolver;
 
 enum struct symbol : std::uint8_t { A, B, ADD, LITERAL };
 
@@ -36,42 +40,61 @@ auto Add(EGraph &egraph, EClassId left, EClassId right) {
   return egraph.emplace(symbol::ADD, {left, right});
 }
 
+// Simple cost models using DefaultCostResult<double>.
+// All models use the unified signature: (enode, enode_id, span<CostResult>) -> CostResult.
+struct UniformCostModel {
+  using CostResult = DefaultCostResult<double>;
+
+  static auto operator()(ENode<symbol> const & /*current*/, ENodeId enode_id,
+                         std::span<CostResult const *const> children) -> CostResult {
+    auto child_sum = std::ranges::fold_left(
+        children, 0.0, [](double acc, CostResult const *c) { return acc + c->resolve().second; });
+    return CostResult{1.0 + child_sum, enode_id};
+  }
+};
+
+struct SymbolCostModel {
+  using CostResult = DefaultCostResult<double>;
+  double a_cost;
+  double b_cost;
+
+  auto operator()(ENode<symbol> const &current, ENodeId enode_id, std::span<CostResult const *const> children) const
+      -> CostResult {
+    auto child_sum = std::ranges::fold_left(
+        children, 0.0, [](double acc, CostResult const *c) { return acc + c->resolve().second; });
+    return CostResult{(current.symbol() == symbol::A ? a_cost : b_cost) + child_sum, enode_id};
+  }
+};
+
+// Test helper: runs the full extraction pipeline (ComputeFrontiers + DefaultResolver).
+// Returns entries in children-before-parents order.
+template <typename CostModel>
+auto TestExtract(EGraph<symbol, analysis> const &egraph, CostModel const &cost_model, EClassId root)
+    -> std::vector<std::pair<EClassId, ENodeId>> {
+  extract::FrontierContext<typename CostModel::CostResult> frontier_ctx;
+  std::vector<std::pair<EClassId, ENodeId>> out;
+  (void)extract::ComputeFrontiers(egraph, cost_model, root, frontier_ctx);
+  DefaultResolver{}(egraph, frontier_ctx.frontier_map, root, out);
+  return out;
+}
+
 TEST(Extract_Basic, BasicLeafExtraction) {
-  struct CostModel {
-    using CostResult = double;
-
-    static auto operator()(ENode<symbol> const & /* current */, std::span<CostResult const> children) -> CostResult {
-      return 1.0 + std::ranges::fold_left(children, 0.0, [](double acc, CostResult const &val) { return acc + val; });
-    }
-  };
-
   auto egraph = EGraph<symbol, analysis>{};
   auto [root_class, root_enode, root_new] = egraph.emplace(symbol::A);
-  auto extractor = Extractor{egraph, CostModel{}};
-  auto extracted = extractor.Extract(root_class);
+  auto extracted = TestExtract(egraph, UniformCostModel{}, root_class);
   ASSERT_EQ(extracted.size(), 1);
   ASSERT_EQ(extracted[0].first, root_class);
   ASSERT_EQ(extracted[0].second, root_enode);
 }
 
 TEST(Extract_Basic, CheapestRootSelected) {
-  struct CostModel {
-    using CostResult = double;
-
-    static auto operator()(ENode<symbol> const &current, std::span<CostResult const> children) -> CostResult {
-      return (current.symbol() == symbol::A ? 1.0 : 2.0) +
-             std::ranges::fold_left(children, 0.0, [](double acc, CostResult const &val) { return acc + val; });
-    }
-  };
-
   auto egraph = EGraph<symbol, analysis>{};
   auto [aclass, anode, a_new] = egraph.emplace(symbol::A);
   auto [bclass, bnode, b_new] = egraph.emplace(symbol::B);
   auto [root, _] = egraph.merge(aclass, bclass);
   auto ctx = ProcessingContext<symbol>{};
   egraph.rebuild(ctx);
-  auto extractor = Extractor{egraph, CostModel{}};
-  auto extracted = extractor.Extract(root);
+  auto extracted = TestExtract(egraph, SymbolCostModel{1.0, 2.0}, root);
   ASSERT_EQ(extracted.size(), 1);
   ASSERT_EQ(extracted[0].first, root);
   ASSERT_EQ(extracted[0].second, anode);
@@ -81,81 +104,90 @@ TEST(Extract_Basic, CheapestRootSelected) {
 // Extract_Cost Tests
 // ========================================
 
-TEST(Extract_Cost, SingleLeafNode) {
-  struct CostModel {
-    using CostResult = double;
+// Helper: wraps a simple (ENode -> double) cost function into a cost model.
+template <typename Fn>
+struct SimpleCostModel {
+  using CostResult = DefaultCostResult<double>;
+  Fn fn;
 
-    static auto operator()(ENode<symbol> const & /* current */, std::span<CostResult const> children) -> CostResult {
-      return 5.0 + std::ranges::fold_left(children, 0.0, [](double acc, CostResult const &val) { return acc + val; });
-    }
-  };
+  auto operator()(ENode<symbol> const &enode, ENodeId enode_id, std::span<CostResult const *const> children) const
+      -> CostResult {
+    auto child_sum = std::ranges::fold_left(
+        children, 0.0, [](double acc, CostResult const *c) { return acc + c->resolve().second; });
+    return CostResult{fn(enode) + child_sum, enode_id};
+  }
+};
+
+// Convenience alias: FrontierMap keyed by CostModel rather than CostResult.
+template <typename CostModel>
+using TestFrontierContext = extract::FrontierContext<typename CostModel::CostResult>;
+
+template <typename CostResult>
+auto FrontierCost(FrontierMap<CostResult> const &m, EClassId id) {
+  return m.at(id)->resolve().second;
+}
+
+template <typename CostResult>
+auto FrontierEnode(FrontierMap<CostResult> const &m, EClassId id) {
+  return m.at(id)->resolve().first;
+}
+
+TEST(Extract_Cost, SingleLeafNode) {
+  auto cost_model = SimpleCostModel{[](ENode<symbol> const &) { return 5.0; }};
+  using CostModel = decltype(cost_model);
 
   auto egraph = EGraph<symbol, analysis>{};
   auto [leaf_class, leaf_node, leaf_new] = egraph.emplace(symbol::A);
 
-  std::unordered_map<EClassId, Selection<CostModel::CostResult>> cheapest_enode;
+  TestFrontierContext<CostModel> frontiers;
+  auto cost = extract::ComputeFrontiers(egraph, cost_model, leaf_class, frontiers);
 
-  auto cost = ProcessCosts(egraph, CostModel{}, leaf_class, cheapest_enode);
-
-  ASSERT_EQ(cost, 5.0);
-  ASSERT_EQ(cheapest_enode.size(), 1);
-  ASSERT_EQ(cheapest_enode[leaf_class].enode_id, leaf_node);
-  ASSERT_EQ(cheapest_enode[leaf_class].cost_result, 5.0);
+  ASSERT_TRUE(cost != nullptr);
+  ASSERT_EQ(cost->cost, 5.0);
+  ASSERT_EQ(frontiers.frontier_map.size(), 1);
+  ASSERT_EQ(FrontierEnode(frontiers.frontier_map, leaf_class), leaf_node);
+  ASSERT_EQ(FrontierCost(frontiers.frontier_map, leaf_class), 5.0);
 }
 
 TEST(Extract_Cost, SimpleTree) {
-  struct CostModel {
-    using CostResult = double;
-
-    static auto operator()(ENode<symbol> const & /*current*/, std::span<CostResult const> children) -> CostResult {
-      return 1.0 + std::ranges::fold_left(children, 0.0, [](double acc, CostResult const &val) { return acc + val; });
-    }
-  };
+  auto cost_model = SimpleCostModel{[](ENode<symbol> const &) { return 1.0; }};
+  using CostModel = decltype(cost_model);
 
   auto egraph = EGraph<symbol, analysis>{};
   auto [left_class, left_node, left_new] = egraph.emplace(symbol::A);
   auto [right_class, right_node, right_new] = egraph.emplace(symbol::B);
   auto [root_class, root_node, root_new] = egraph.emplace(symbol::A, {left_class, right_class});
 
-  std::unordered_map<EClassId, Selection<CostModel::CostResult>> cheapest_enode;
-
-  auto cost = ProcessCosts(egraph, CostModel{}, root_class, cheapest_enode);
+  TestFrontierContext<CostModel> frontiers;
+  auto cost = extract::ComputeFrontiers(egraph, cost_model, root_class, frontiers);
 
   // Cost should be: 1 (root) + 1 (left) + 1 (right) = 3
-  ASSERT_EQ(cost, 3.0);
-  ASSERT_EQ(cheapest_enode.size(), 3);
+  ASSERT_TRUE(cost != nullptr);
+  ASSERT_EQ(cost->cost, 3.0);
+  ASSERT_EQ(frontiers.frontier_map.size(), 3);
 }
 
 TEST(Extract_Cost, DeepTree) {
-  struct CostModel {
-    using CostResult = double;
-
-    static auto operator()(ENode<symbol> const & /*current*/, std::span<CostResult const> children) -> CostResult {
-      return 1.0 + std::ranges::fold_left(children, 0.0, [](double acc, CostResult const &val) { return acc + val; });
-    }
-  };
+  auto cost_model = SimpleCostModel{[](ENode<symbol> const &) { return 1.0; }};
+  using CostModel = decltype(cost_model);
 
   auto egraph = EGraph<symbol, analysis>{};
   auto [leaf_class, leaf_node, leaf_new] = egraph.emplace(symbol::A);
   auto [mid_class, mid_node, mid_new] = egraph.emplace(symbol::B, {leaf_class});
   auto [root_class, root_node, root_new] = egraph.emplace(symbol::A, {mid_class});
 
-  std::unordered_map<EClassId, Selection<CostModel::CostResult>> cheapest_enode;
-  auto cost = ProcessCosts(egraph, CostModel{}, root_class, cheapest_enode);
+  TestFrontierContext<CostModel> frontiers;
+  auto cost = extract::ComputeFrontiers(egraph, cost_model, root_class, frontiers);
 
   // Cost should be: 1 (root) + 1 (mid) + 1 (leaf) = 3
-  ASSERT_EQ(cost, 3.0);
-  ASSERT_EQ(cheapest_enode.size(), 3);
+  ASSERT_TRUE(cost != nullptr);
+  ASSERT_EQ(cost->cost, 3.0);
+  ASSERT_EQ(frontiers.frontier_map.size(), 3);
 }
 
 TEST(Extract_Cost, DiamondDAGSharedNode) {
-  struct CostModel {
-    using CostResult = double;
-
-    static auto operator()(ENode<symbol> const & /*current*/, std::span<CostResult const> children) -> CostResult {
-      return 1.0 + std::ranges::fold_left(children, 0.0, [](double acc, CostResult const &val) { return acc + val; });
-    }
-  };
+  auto cost_model = SimpleCostModel{[](ENode<symbol> const &) { return 1.0; }};
+  using CostModel = decltype(cost_model);
 
   auto egraph = EGraph<symbol, analysis>{};
   auto [shared_class, shared_node, shared_new] = egraph.emplace(symbol::A);
@@ -163,51 +195,42 @@ TEST(Extract_Cost, DiamondDAGSharedNode) {
   auto [right_class, right_node, right_new] = egraph.emplace(symbol::B, {shared_class}, 2);  // disambiguator = 2
   auto [root_class, root_node, root_new] = egraph.emplace(symbol::A, {left_class, right_class});
 
-  std::unordered_map<EClassId, Selection<CostModel::CostResult>> cheapest_enode;
-  auto cost = ProcessCosts(egraph, CostModel{}, root_class, cheapest_enode);
+  TestFrontierContext<CostModel> frontiers;
+  auto cost = extract::ComputeFrontiers(egraph, cost_model, root_class, frontiers);
 
   // Shared node should only be computed once via memoization
   // Cost: root=1 + (left=1+shared=1) + (right=1+shared=1) = 1+2+2 = 5
-  ASSERT_EQ(cost, 5.0);
-  ASSERT_EQ(cheapest_enode.size(), 4);
-  ASSERT_EQ(cheapest_enode[shared_class].cost_result, 1);
-  ASSERT_EQ(cheapest_enode[left_class].cost_result, 2);
-  ASSERT_EQ(cheapest_enode[right_class].cost_result, 2);
-  ASSERT_EQ(cheapest_enode[root_class].cost_result, 5);
+  ASSERT_TRUE(cost != nullptr);
+  ASSERT_EQ(cost->cost, 5.0);
+  ASSERT_EQ(frontiers.frontier_map.size(), 4);
+  ASSERT_EQ(FrontierCost(frontiers.frontier_map, shared_class), 1);
+  ASSERT_EQ(FrontierCost(frontiers.frontier_map, left_class), 2);
+  ASSERT_EQ(FrontierCost(frontiers.frontier_map, right_class), 2);
+  ASSERT_EQ(FrontierCost(frontiers.frontier_map, root_class), 5);
 }
 
 TEST(Extract_Cost, VariableCostBySymbol) {
-  struct CostModel {
-    using CostResult = double;
-
-    static auto operator()(ENode<symbol> const &current, std::span<CostResult const> children) -> CostResult {
-      return (current.symbol() == symbol::A ? 2.0 : 5.0) +
-             std::ranges::fold_left(children, 0.0, [](double acc, CostResult const &val) { return acc + val; });
-    }
-  };
+  auto cost_model = SimpleCostModel{[](ENode<symbol> const &e) { return e.symbol() == symbol::A ? 2.0 : 5.0; }};
+  using CostModel = decltype(cost_model);
 
   auto egraph = EGraph<symbol, analysis>{};
   auto [aclass, anode, a_new] = egraph.emplace(symbol::A);
   auto [bclass, bnode, b_new] = egraph.emplace(symbol::B);
 
-  std::unordered_map<EClassId, Selection<CostModel::CostResult>> cheapest_enode;
+  TestFrontierContext<CostModel> frontiers;
 
-  auto cost_a = ProcessCosts(egraph, CostModel{}, aclass, cheapest_enode);
-  auto cost_b = ProcessCosts(egraph, CostModel{}, bclass, cheapest_enode);
+  auto cost_a = extract::ComputeFrontiers(egraph, cost_model, aclass, frontiers);
+  auto cost_b = extract::ComputeFrontiers(egraph, cost_model, bclass, frontiers);
 
-  ASSERT_EQ(cost_a, 2.0);
-  ASSERT_EQ(cost_b, 5.0);
+  ASSERT_TRUE(cost_a != nullptr);
+  ASSERT_TRUE(cost_b != nullptr);
+  ASSERT_EQ(cost_a->cost, 2.0);
+  ASSERT_EQ(cost_b->cost, 5.0);
 }
 
 TEST(Extract_Cost, SelectsCheapestAmongEquivalents) {
-  struct CostModel {
-    using CostResult = double;
-
-    static auto operator()(ENode<symbol> const &current, std::span<CostResult const> children) -> CostResult {
-      return (current.symbol() == symbol::A ? 1.0 : 10.0) +
-             std::ranges::fold_left(children, 0.0, [](double acc, CostResult const &val) { return acc + val; });
-    }
-  };
+  auto cost_model = SimpleCostModel{[](ENode<symbol> const &e) { return e.symbol() == symbol::A ? 1.0 : 10.0; }};
+  using CostModel = decltype(cost_model);
 
   auto egraph = EGraph<symbol, analysis>{};
   auto [aclass, anode, a_new] = egraph.emplace(symbol::A);
@@ -216,36 +239,32 @@ TEST(Extract_Cost, SelectsCheapestAmongEquivalents) {
   auto ctx = ProcessingContext<symbol>{};
   egraph.rebuild(ctx);
 
-  std::unordered_map<EClassId, Selection<CostModel::CostResult>> cheapest_enode;
+  TestFrontierContext<CostModel> frontiers;
 
-  auto cost = ProcessCosts(egraph, CostModel{}, root, cheapest_enode);
+  auto cost = extract::ComputeFrontiers(egraph, cost_model, root, frontiers);
 
-  ASSERT_EQ(cost, 1.0);
-  ASSERT_EQ(cheapest_enode[root].enode_id, anode);
-  ASSERT_EQ(cheapest_enode[root].cost_result, 1.0);
+  ASSERT_TRUE(cost != nullptr);
+  ASSERT_EQ(cost->cost, 1.0);
+  ASSERT_EQ(FrontierEnode(frontiers.frontier_map, root), anode);
+  ASSERT_EQ(FrontierCost(frontiers.frontier_map, root), 1.0);
 }
 
 TEST(Extract_Cost, CostAccumulationWithVariableCosts) {
-  struct CostModel {
-    using CostResult = double;
-
-    static auto operator()(ENode<symbol> const &current, std::span<CostResult const> children) -> CostResult {
-      return (current.symbol() == symbol::A ? 2.0 : 3.0) +
-             std::ranges::fold_left(children, 0.0, [](double acc, CostResult const &val) { return acc + val; });
-    }
-  };
+  auto cost_model = SimpleCostModel{[](ENode<symbol> const &e) { return e.symbol() == symbol::A ? 2.0 : 3.0; }};
+  using CostModel = decltype(cost_model);
 
   auto egraph = EGraph<symbol, analysis>{};
   auto [leaf1_class, leaf1_node, leaf1_new] = egraph.emplace(symbol::A);
   auto [leaf2_class, leaf2_node, leaf2_new] = egraph.emplace(symbol::B);
   auto [root_class, root_node, root_new] = egraph.emplace(symbol::A, {leaf1_class, leaf2_class});
 
-  std::unordered_map<EClassId, Selection<CostModel::CostResult>> cheapest_enode;
+  TestFrontierContext<CostModel> frontiers;
 
-  auto cost = ProcessCosts(egraph, CostModel{}, root_class, cheapest_enode);
+  auto cost = extract::ComputeFrontiers(egraph, cost_model, root_class, frontiers);
 
   // Cost: 2 (root, symbol A) + 2 (leaf1, symbol A) + 3 (leaf2, symbol B) = 7
-  ASSERT_EQ(cost, 7.0);
+  ASSERT_TRUE(cost != nullptr);
+  ASSERT_EQ(cost->cost, 7.0);
 }
 
 TEST(Extract_Cost, CyclicEGraphInfiniteCost) {
@@ -256,13 +275,8 @@ TEST(Extract_Cost, CyclicEGraphInfiniteCost) {
   // The 'ADD' node can't be the cheapest because it depends on itself
   // If all e-nodes in the e-class are cyclic, the cost should be infinite
 
-  struct CostModel {
-    using CostResult = double;
-
-    static auto operator()(ENode<symbol> const & /* current */, std::span<CostResult const> children) -> CostResult {
-      return 1.0 + std::ranges::fold_left(children, 0.0, [](double acc, CostResult const &val) { return acc + val; });
-    }
-  };
+  auto cost_model = SimpleCostModel{[](ENode<symbol> const &) { return 1.0; }};
+  using CostModel = decltype(cost_model);
 
   auto egraph = EGraph<symbol, analysis>{};
 
@@ -280,16 +294,17 @@ TEST(Extract_Cost, CyclicEGraphInfiniteCost) {
   auto ctx = ProcessingContext<symbol>{};
   egraph.rebuild(ctx);
 
-  std::unordered_map<EClassId, Selection<CostModel::CostResult>> cheapest_enode;
+  TestFrontierContext<CostModel> frontiers;
 
   // Process the cyclic e-class
-  auto cost = ProcessCosts(egraph, CostModel{}, cyclic_class, cheapest_enode);
+  auto cost = extract::ComputeFrontiers(egraph, cost_model, cyclic_class, frontiers);
 
   // The cyclic 'ADD' node should have infinite cost (or very large)
   // The non-cyclic LITERAL node should be selected with cost 1
-  ASSERT_EQ(cost, 1.0);
-  ASSERT_EQ(cheapest_enode[cyclic_class].enode_id, x_node);
-  ASSERT_EQ(cheapest_enode[cyclic_class].cost_result, 1.0);
+  ASSERT_TRUE(cost != nullptr);
+  ASSERT_EQ(cost->cost, 1.0);
+  ASSERT_EQ(FrontierEnode(frontiers.frontier_map, cyclic_class), x_node);
+  ASSERT_EQ(FrontierCost(frontiers.frontier_map, cyclic_class), 1.0);
 }
 
 TEST(Extract_Cost, CyclicEGraphInfiniteCostComplex) {
@@ -300,13 +315,8 @@ TEST(Extract_Cost, CyclicEGraphInfiniteCostComplex) {
   // The 'ADD' node can't be the cheapest because it depends on itself
   // If all e-nodes in the e-class are cyclic, the cost should be infinite
 
-  struct CostModel {
-    using CostResult = double;
-
-    static auto operator()(ENode<symbol> const & /* current */, std::span<CostResult const> children) -> CostResult {
-      return 1.0 + std::ranges::fold_left(children, 0.0, [](double acc, CostResult const &val) { return acc + val; });
-    }
-  };
+  auto cost_model = SimpleCostModel{[](ENode<symbol> const &) { return 1.0; }};
+  using CostModel = decltype(cost_model);
 
   auto egraph = EGraph<symbol, analysis>{};
 
@@ -326,21 +336,22 @@ TEST(Extract_Cost, CyclicEGraphInfiniteCostComplex) {
   auto ctx = ProcessingContext<symbol>{};
   egraph.rebuild(ctx);
 
-  std::unordered_map<EClassId, Selection<CostModel::CostResult>> cheapest_enode;
+  TestFrontierContext<CostModel> frontiers;
 
   // Process the cyclic e-class
-  auto cost = ProcessCosts(egraph, CostModel{}, merged_class, cheapest_enode);
+  auto cost = extract::ComputeFrontiers(egraph, cost_model, merged_class, frontiers);
 
   // The cyclic 'ADD' node should have infinite cost (or very large)
   // The non-cyclic LITERAL node should be selected with cost 1
-  ASSERT_EQ(cost, 1.0);
-  ASSERT_EQ(cheapest_enode.size(), 2);
-  ASSERT_TRUE(cheapest_enode.contains(merged_class));
-  ASSERT_EQ(cheapest_enode[merged_class].cost_result, 1.0);
-  ASSERT_EQ(cheapest_enode[merged_class].enode_id, x_node);
-  ASSERT_TRUE(cheapest_enode.contains(zero_class));
-  ASSERT_EQ(cheapest_enode[zero_class].cost_result, 1.0);
-  ASSERT_EQ(cheapest_enode[zero_class].enode_id, zero_node);
+  ASSERT_TRUE(cost != nullptr);
+  ASSERT_EQ(cost->cost, 1.0);
+  ASSERT_EQ(frontiers.frontier_map.size(), 2);
+  ASSERT_TRUE(frontiers.frontier_map.contains(merged_class));
+  ASSERT_EQ(FrontierCost(frontiers.frontier_map, merged_class), 1.0);
+  ASSERT_EQ(FrontierEnode(frontiers.frontier_map, merged_class), x_node);
+  ASSERT_TRUE(frontiers.frontier_map.contains(zero_class));
+  ASSERT_EQ(FrontierCost(frontiers.frontier_map, zero_class), 1.0);
+  ASSERT_EQ(FrontierEnode(frontiers.frontier_map, zero_class), zero_node);
 }
 
 TEST(Extract_Cost, FullyCyclicEClassInfiniteCost) {
@@ -349,13 +360,8 @@ TEST(Extract_Cost, FullyCyclicEClassInfiniteCost) {
   // Both ADD nodes reference the e-class they're in, creating unavoidable
   // cycles
 
-  struct CostModel {
-    using CostResult = double;
-
-    static auto operator()(ENode<symbol> const & /* current */, std::span<CostResult const> children) -> CostResult {
-      return 1.0 + std::ranges::fold_left(children, 0.0, [](double acc, CostResult const &val) { return acc + val; });
-    }
-  };
+  auto cost_model = SimpleCostModel{[](ENode<symbol> const &) { return 1.0; }};
+  using CostModel = decltype(cost_model);
 
   auto egraph = EGraph<symbol, analysis>{};
 
@@ -378,185 +384,18 @@ TEST(Extract_Cost, FullyCyclicEClassInfiniteCost) {
   auto ctx = ProcessingContext<symbol>{};
   egraph.rebuild(ctx);
 
-  std::unordered_map<EClassId, Selection<CostModel::CostResult>> cheapest_enode;
+  TestFrontierContext<CostModel> frontiers;
 
   // This should either:
   // 1. Return infinity/max double if all nodes are cyclic
   // 2. Select the original X node if it still exists in the e-class
-  auto cost = ProcessCosts(egraph, CostModel{}, fully_cyclic, cheapest_enode);
+  auto cost = extract::ComputeFrontiers(egraph, cost_model, fully_cyclic, frontiers);
 
   // After merges, the original x_node should still be selectable
   // It has cost 1 (no children), while the 'ADD' nodes have infinite cost
-  ASSERT_EQ(cost, 1.0);
-  ASSERT_EQ(cheapest_enode[fully_cyclic].enode_id, x_node);
-}
-
-// ========================================
-// Extract_Dependencies Tests
-// ========================================
-
-TEST(Extract_Dependencies, SingleLeafNode) {
-  auto egraph = EGraph<symbol, analysis>{};
-  auto [leaf_class, leaf_node, leaf_new] = egraph.emplace(symbol::A);
-  std::unordered_map<EClassId, Selection<double>> cheapest_enode;
-  cheapest_enode[leaf_class] = {leaf_node, 1.0};
-
-  auto in_degree = CollectDependencies(egraph, cheapest_enode, leaf_class);
-
-  // Leaf has no children, so in_degree should be empty
-  ASSERT_EQ(in_degree.size(), 1);
-}
-
-TEST(Extract_Dependencies, LinearChain) {
-  auto egraph = EGraph<symbol, analysis>{};
-  auto [leaf_class, leaf_node, leaf_new] = egraph.emplace(symbol::A);
-  auto [mid_class, mid_node, mid_new] = egraph.emplace(symbol::B, {leaf_class});
-  auto [root_class, root_node, root_new] = egraph.emplace(symbol::A, {mid_class});
-
-  std::unordered_map<EClassId, Selection<double>> cheapest_enode;
-  cheapest_enode[leaf_class] = {leaf_node, 1.0};
-  cheapest_enode[mid_class] = {mid_node, 1.0};
-  cheapest_enode[root_class] = {root_node, 1.0};
-
-  auto in_degree = CollectDependencies(egraph, cheapest_enode, root_class);
-
-  // mid has in_degree 1 (from root), leaf has in_degree 1 (from mid)
-  ASSERT_EQ(in_degree.size(), 3);
-  ASSERT_EQ(in_degree[root_class], 0);
-  ASSERT_EQ(in_degree[mid_class], 1);
-  ASSERT_EQ(in_degree[leaf_class], 1);
-}
-
-TEST(Extract_Dependencies, SimpleTree) {
-  auto egraph = EGraph<symbol, analysis>{};
-  auto [left_class, left_node, left_new] = egraph.emplace(symbol::A);
-  auto [right_class, right_node, right_new] = egraph.emplace(symbol::B);
-  auto [root_class, root_node, root_new] = egraph.emplace(symbol::A, {left_class, right_class});
-
-  std::unordered_map<EClassId, Selection<double>> cheapest_enode;
-  cheapest_enode[left_class] = {left_node, 1.0};
-  cheapest_enode[right_class] = {right_node, 1.0};
-  cheapest_enode[root_class] = {root_node, 1.0};
-
-  auto in_degree = CollectDependencies(egraph, cheapest_enode, root_class);
-
-  // Both left and right have in_degree 1 (from root)
-  ASSERT_EQ(in_degree.size(), 3);
-  ASSERT_EQ(in_degree[left_class], 1);
-  ASSERT_EQ(in_degree[right_class], 1);
-  ASSERT_EQ(in_degree[root_class], 0);
-}
-
-TEST(Extract_Dependencies, DiamondDAG) {
-  auto egraph = EGraph<symbol, analysis>{};
-  auto [shared_class, shared_node, shared_new] = egraph.emplace(symbol::A);
-  auto [left_class, left_node, left_new] = egraph.emplace(symbol::B, {shared_class}, 1);     // disambiguator = 1
-  auto [right_class, right_node, right_new] = egraph.emplace(symbol::B, {shared_class}, 2);  // disambiguator = 2
-  auto [root_class, root_node, root_new] = egraph.emplace(symbol::A, {left_class, right_class});
-
-  std::unordered_map<EClassId, Selection<double>> cheapest_enode;
-  cheapest_enode[shared_class] = {shared_node, 1.0};
-  cheapest_enode[left_class] = {left_node, 1.0};
-  cheapest_enode[right_class] = {right_node, 1.0};
-  cheapest_enode[root_class] = {root_node, 1.0};
-
-  auto in_degree = CollectDependencies(egraph, cheapest_enode, root_class);
-
-  // shared has in_degree 2 (from left and right)
-  // left and right each have in_degree 1 (from root)
-  ASSERT_EQ(in_degree.size(), 4);
-  ASSERT_EQ(in_degree[root_class], 0);
-  ASSERT_EQ(in_degree[left_class], 1);
-  ASSERT_EQ(in_degree[right_class], 1);
-  ASSERT_EQ(in_degree[shared_class], 2);
-}
-
-// ========================================
-// Extract_TopologicalSort Tests
-// ========================================
-
-TEST(Extract_TopologicalSort, SingleNode) {
-  auto egraph = EGraph<symbol, analysis>{};
-  auto [leaf_class, leaf_node, leaf_new] = egraph.emplace(symbol::A);
-  std::unordered_map<EClassId, Selection<double>> cheapest_enode{};
-  cheapest_enode[leaf_class] = {leaf_node, 1.0};
-  auto in_degree = std::unordered_map<EClassId, int>{{leaf_class, 0}};
-  auto result = TopologicalSort(egraph, cheapest_enode, in_degree);
-
-  ASSERT_EQ(result.size(), 1);
-  ASSERT_EQ(result[0].first, leaf_class);
-  ASSERT_EQ(result[0].second, leaf_node);
-}
-
-TEST(Extract_TopologicalSort, LinearChainOrdering) {
-  auto egraph = EGraph<symbol, analysis>{};
-  auto [leaf_class, leaf_node, leaf_new] = egraph.emplace(symbol::A);
-  auto [mid_class, mid_node, mid_new] = egraph.emplace(symbol::B, {leaf_class});
-  auto [root_class, root_node, root_new] = egraph.emplace(symbol::A, {mid_class});
-
-  std::unordered_map<EClassId, Selection<double>> cheapest_enode;
-  cheapest_enode[leaf_class] = {leaf_node, 1.0};
-  cheapest_enode[mid_class] = {mid_node, 1.0};
-  cheapest_enode[root_class] = {root_node, 1.0};
-  std::unordered_map<EClassId, int> in_degree;
-  in_degree[root_class] = 0;
-  in_degree[mid_class] = 1;
-  in_degree[leaf_class] = 1;
-  auto result = TopologicalSort(egraph, cheapest_enode, in_degree);
-
-  ASSERT_EQ(result.size(), 3);
-  // Order should be: root, mid, leaf
-  ASSERT_EQ(result[0].first, root_class);
-  ASSERT_EQ(result[1].first, mid_class);
-  ASSERT_EQ(result[2].first, leaf_class);
-}
-
-TEST(Extract_TopologicalSort, SimpleTreeOrdering) {
-  auto egraph = EGraph<symbol, analysis>{};
-  auto [left_class, left_node, left_new] = egraph.emplace(symbol::A);
-  auto [right_class, right_node, right_new] = egraph.emplace(symbol::B);
-  auto [root_class, root_node, root_new] = egraph.emplace(symbol::A, {left_class, right_class});
-
-  std::unordered_map<EClassId, Selection<double>> cheapest_enode;
-  cheapest_enode[left_class] = {left_node, 1.0};
-  cheapest_enode[right_class] = {right_node, 1.0};
-  cheapest_enode[root_class] = {root_node, 1.0};
-  std::unordered_map<EClassId, int> in_degree;
-  in_degree[left_class] = 1;
-  in_degree[right_class] = 1;
-  in_degree[root_class] = 0;
-  auto result = TopologicalSort(egraph, cheapest_enode, in_degree);
-
-  ASSERT_EQ(result.size(), 3);
-  // Root should come first
-  ASSERT_EQ(result[0].first, root_class);
-  // Left and right can come in any order, but both should be after root
-}
-
-TEST(Extract_TopologicalSort, DiamondTopology) {
-  auto egraph = EGraph<symbol, analysis>{};
-  auto [shared_class, shared_node, shared_new] = egraph.emplace(symbol::A);
-  auto [left_class, left_node, left_new] = egraph.emplace(symbol::B, {shared_class}, 1);     // disambiguator = 1
-  auto [right_class, right_node, right_new] = egraph.emplace(symbol::B, {shared_class}, 2);  // disambiguator = 2
-  auto [root_class, root_node, root_new] = egraph.emplace(symbol::A, {left_class, right_class});
-
-  std::unordered_map<EClassId, Selection<double>> cheapest_enode;
-  cheapest_enode[shared_class] = {shared_node, 1.0};
-  cheapest_enode[left_class] = {left_node, 1.0};
-  cheapest_enode[right_class] = {right_node, 1.0};
-  cheapest_enode[root_class] = {root_node, 1.0};
-  std::unordered_map<EClassId, int> in_degree;
-  in_degree[left_class] = 1;
-  in_degree[right_class] = 1;
-  in_degree[shared_class] = 2;
-  in_degree[root_class] = 0;
-  auto result = TopologicalSort(egraph, cheapest_enode, in_degree);
-
-  ASSERT_EQ(result.size(), 4);
-  // Root comes first
-  ASSERT_EQ(result[0].first, root_class);
-  // Shared must come after both left and right
-  ASSERT_EQ(result[3].first, shared_class);
+  ASSERT_TRUE(cost != nullptr);
+  ASSERT_EQ(cost->cost, 1.0);
+  ASSERT_EQ(FrontierEnode(frontiers.frontier_map, fully_cyclic), x_node);
 }
 
 // ========================================
@@ -564,64 +403,34 @@ TEST(Extract_TopologicalSort, DiamondTopology) {
 // ========================================
 
 TEST(Extract_Basic, IntegrationComplexTree) {
-  struct CostModel {
-    using CostResult = double;
-
-    static auto operator()(ENode<symbol> const & /* current */, std::span<CostResult const> children) -> CostResult {
-      return 1.0 + std::ranges::fold_left(children, 0.0, [](double acc, CostResult const &val) { return acc + val; });
-    }
-  };
-
   auto egraph = EGraph<symbol, analysis>{};
   auto [l1_class, l1_node, l1_new] = egraph.emplace(symbol::A);
   auto [l2_class, l2_node, l2_new] = egraph.emplace(symbol::B);
   auto [mid_class, mid_node, mid_new] = egraph.emplace(symbol::A, {l1_class, l2_class});
   auto [root_class, root_node, root_new] = egraph.emplace(symbol::B, {mid_class});
 
-  auto extractor = Extractor{egraph, CostModel{}};
-  auto extracted = extractor.Extract(root_class);
+  auto extracted = TestExtract(egraph, UniformCostModel{}, root_class);
 
   ASSERT_EQ(extracted.size(), 4);
-  // Verify root is first
-  ASSERT_EQ(extracted[0].first, root_class);
-  ASSERT_EQ(extracted[1].first, mid_class);
+  ASSERT_EQ(extracted.back().first, root_class);
+  ASSERT_EQ(extracted[2].first, mid_class);
 }
 
 TEST(Extract_Basic, IntegrationDiamondDAG) {
-  struct CostModel {
-    using CostResult = double;
-
-    static auto operator()(ENode<symbol> const & /* current */, std::span<CostResult const> children) -> CostResult {
-      return 1.0 + std::ranges::fold_left(children, 0.0, [](double acc, CostResult const &val) { return acc + val; });
-    }
-  };
-
   auto egraph = EGraph<symbol, analysis>{};
   auto [shared_class, shared_node, shared_new] = egraph.emplace(symbol::A);
   auto [left_class, left_node, left_new] = egraph.emplace(symbol::B, {shared_class}, 1);     // disambiguator = 1
   auto [right_class, right_node, right_new] = egraph.emplace(symbol::B, {shared_class}, 2);  // disambiguator = 2
   auto [root_class, root_node, root_new] = egraph.emplace(symbol::A, {left_class, right_class});
 
-  auto extractor = Extractor{egraph, CostModel{}};
-  auto extracted = extractor.Extract(root_class);
+  auto extracted = TestExtract(egraph, UniformCostModel{}, root_class);
 
   ASSERT_EQ(extracted.size(), 4);
-  // Verify shared node comes last
-  ASSERT_EQ(extracted[0].first, root_class);
-  ASSERT_EQ(extracted[3].first, shared_class);
+  ASSERT_EQ(extracted.back().first, root_class);
+  ASSERT_EQ(extracted[0].first, shared_class);
 }
 
 TEST(Extract_Basic, IntegrationNestedEquivalence) {
-  struct CostModel {
-    using CostResult = double;
-
-    static auto operator()(ENode<symbol> const &current, std::span<CostResult const> children) -> CostResult {
-      auto base_cost = (current.symbol() == symbol::A ? 1.0 : 5.0);
-      return base_cost +
-             std::ranges::fold_left(children, 0.0, [](double acc, CostResult const &val) { return acc + val; });
-    }
-  };
-
   auto egraph = EGraph<symbol, analysis>{};
   // Create equivalence at leaf level
   auto [a1_class, a1_node, a1_new] = egraph.emplace(symbol::A);
@@ -635,11 +444,881 @@ TEST(Extract_Basic, IntegrationNestedEquivalence) {
   auto ctx = ProcessingContext<symbol>{};
   egraph.rebuild(ctx);
 
-  auto extractor = Extractor{egraph, CostModel{}};
-  auto extracted = extractor.Extract(root);
+  auto extracted = TestExtract(egraph, SymbolCostModel{1.0, 5.0}, root);
 
   ASSERT_EQ(extracted.size(), 2);
-  // Should select cheaper A nodes at both levels
-  ASSERT_EQ(extracted[0].second, a2_node);
-  ASSERT_EQ(extracted[1].second, a1_node);
+  ASSERT_EQ(extracted[0].second, a1_node);
+  ASSERT_EQ(extracted[1].second, a2_node);
+}
+
+// ========================================
+// Extract_Safety Tests
+// ========================================
+// These tests verify defensive paths in ComputeFrontiers:
+//   - best_alt() returns nullptr on empty frontier
+//   - resolve() asserts non-null
+//   - pick_compatible fallback asserts in ResolvePlanSelection
+// The key scenarios are eclasses where ALL enodes are cyclic (no leaf escape),
+// causing ComputeFrontiers to return nullopt and erase the sentinel from frontier_map.
+
+TEST(Extract_Safety, ComputeFrontiers_FullyCyclicReturnsNullopt) {
+  // Build an egraph where an intermediate eclass has NO non-cyclic enode.
+  //
+  //   merged_class = merge(LITERAL(1), ADD(y_class, zero_class))
+  //   y_class      = A(merged_class)
+  //
+  // When computing y_class:
+  //   - Its only enode A(merged_class) recurses into merged_class which is
+  //     already "in progress" -> returns nullopt (cycle detected).
+  //   - ALL enodes of y_class are cyclic -> sentinel erased, returns nullopt.
+  //
+  // Verify:
+  //   1. ComputeFrontiers on merged_class succeeds (LITERAL leaf provides an escape).
+  //   2. frontier_map does NOT contain y_class (fully cyclic, erased).
+  //   3. frontier_map DOES contain merged_class and zero_class.
+
+  auto egraph = EGraph<symbol, analysis>{};
+
+  auto [x_class, x_node, x_new] = egraph.emplace(symbol::LITERAL, 1);
+  auto [y_class, y_node, y_new] = egraph.emplace(symbol::A, {x_class});
+  auto [zero_class, zero_node, zero_new] = egraph.emplace(symbol::LITERAL, 0);
+  auto [plus_class, plus_node, plus_new] = egraph.emplace(symbol::ADD, {y_class, zero_class});
+
+  auto [merged_class, _] = egraph.merge(x_class, plus_class);
+  auto ctx = ProcessingContext<symbol>{};
+  egraph.rebuild(ctx);
+
+  TestFrontierContext<UniformCostModel> frontiers;
+  auto cost = extract::ComputeFrontiers(egraph, UniformCostModel{}, merged_class, frontiers);
+
+  // merged_class has LITERAL(1) as a leaf escape - should succeed
+  ASSERT_TRUE(cost != nullptr);
+  ASSERT_EQ(cost->cost, 1.0);  // LITERAL leaf cost
+
+  // y_class is fully cyclic (its only enode A(merged_class) is a cycle)
+  // ComputeFrontiers should have erased its sentinel - NOT present in frontier_map
+  EXPECT_FALSE(frontiers.frontier_map.contains(y_class)) << "Fully cyclic y_class should not be in frontier_map";
+
+  // merged_class and zero_class should be present
+  EXPECT_TRUE(frontiers.frontier_map.contains(merged_class));
+  EXPECT_TRUE(frontiers.frontier_map.contains(zero_class));
+
+  // The selected enode for merged_class should be the leaf (x_node), not the cyclic ADD
+  EXPECT_EQ(FrontierEnode(frontiers.frontier_map, merged_class), x_node);
+}
+
+TEST(Extract_Safety, ComputeFrontiers_CyclicChildCostsCached) {
+  // Verify that when an enode has a cyclic child, the non-cyclic children's
+  // costs are still computed and cached in frontier_map.
+  //
+  // Build:
+  //   leaf_c  = LITERAL(42)          - non-cyclic leaf
+  //   leaf_d  = LITERAL(99)          - non-cyclic leaf
+  //   b_class = A(leaf_d)            - will become cyclic via merge
+  //   root    = ADD(b_class, leaf_c) - has one cyclic child (b_class) and one non-cyclic (leaf_c)
+  //   merge(b_class, root)           - makes b_class cyclic: {A(leaf_d), ADD(b_class, leaf_c)}
+  //
+  // After merge, b_class contains:
+  //   A(leaf_d)              - references leaf_d (non-cyclic) -> cost = 1+1 = 2
+  //   ADD(b_class, leaf_c)   - references b_class itself (cyclic!) -> skipped
+  //
+  // Computing from b_class:
+  //   b_class "in progress"
+  //   -> Try A(leaf_d): compute leaf_d -> cost=1, cached. A cost=2. Not cyclic.
+  //   -> Try ADD(b_class, leaf_c): compute b_class -> in-progress (cycle!).
+  //       But we continue processing leaf_c -> cost=1, cached.
+  //       ADD is skipped because of cyclic child.
+  //   -> b_class frontier = {A(leaf_d), cost=2}
+  //
+  // Key assertion: leaf_c is cached even though it was a sibling of the cyclic child.
+
+  auto egraph = EGraph<symbol, analysis>{};
+
+  auto [leaf_c_class, leaf_c_node, leaf_c_new] = egraph.emplace(symbol::LITERAL, 42);
+  auto [leaf_d_class, leaf_d_node, leaf_d_new] = egraph.emplace(symbol::LITERAL, 99);
+  auto [b_class, b_node, b_new] = egraph.emplace(symbol::A, {leaf_d_class});
+  auto [root_class, root_node, root_new] = egraph.emplace(symbol::ADD, {b_class, leaf_c_class});
+
+  // Merge b_class with root_class - b_class now has ADD(b_class, leaf_c) creating cycle
+  auto [merged, _] = egraph.merge(b_class, root_class);
+  auto ctx = ProcessingContext<symbol>{};
+  egraph.rebuild(ctx);
+
+  TestFrontierContext<UniformCostModel> frontiers;
+  auto cost = extract::ComputeFrontiers(egraph, UniformCostModel{}, merged, frontiers);
+
+  // merged has A(leaf_d) as non-cyclic escape
+  ASSERT_TRUE(cost != nullptr);
+  ASSERT_EQ(cost->cost, 2.0);  // 1 (A) + 1 (leaf_d)
+
+  // Key: leaf_c should be cached even though it was encountered while processing
+  // the cyclic ADD enode. The "continue processing remaining children" logic
+  // ensures non-cyclic siblings are still computed.
+  EXPECT_TRUE(frontiers.frontier_map.contains(leaf_c_class))
+      << "Non-cyclic sibling leaf_c should be cached in frontier_map";
+  EXPECT_EQ(FrontierCost(frontiers.frontier_map, leaf_c_class), 1.0);
+
+  // leaf_d should also be cached (child of the non-cyclic A enode)
+  EXPECT_TRUE(frontiers.frontier_map.contains(leaf_d_class));
+  EXPECT_EQ(FrontierCost(frontiers.frontier_map, leaf_d_class), 1.0);
+
+  // merged should be present with the A enode selected (not the cyclic ADD)
+  EXPECT_TRUE(frontiers.frontier_map.contains(merged));
+  EXPECT_EQ(FrontierEnode(frontiers.frontier_map, merged), b_node);
+}
+
+TEST(Extract_Safety, ComputeFrontiers_CyclicExprChildOfBind) {
+  // Simulates a Bind-like enode (symbol::A with 3 children [input, sym, expr])
+  // where the expr child's eclass contains a cyclic ADD enode alongside a non-cyclic
+  // LITERAL escape. The has_cyclic_child guard should skip the Bind enode entirely,
+  // but input and sym (processed before expr) must still be cached.
+  auto egraph = EGraph<symbol, analysis>{};
+  auto [input_class, input_node, input_new] = egraph.emplace(symbol::B);
+  auto [sym_class, sym_node, sym_new] = egraph.emplace(symbol::B, {}, 1);
+  auto [leaf_class, leaf_node, leaf_new] = egraph.emplace(symbol::LITERAL, 0);
+  auto [expr_class, expr_node, expr_new] = egraph.emplace(symbol::LITERAL, 99);
+  auto [add_class, add_node, add_new] = egraph.emplace(symbol::ADD, {expr_class, leaf_class});
+  // Merge expr with add to create a cycle in expr_class
+  auto [cyclic_expr, _] = egraph.merge(expr_class, add_class);
+  auto ctx = ProcessingContext<symbol>{};
+  egraph.rebuild(ctx);
+
+  // Bind-like: symbol A with 3 children [input, sym, cyclic_expr]
+  auto [bind_class, bind_node, bind_new] = egraph.emplace(symbol::A, {input_class, sym_class, cyclic_expr});
+
+  TestFrontierContext<UniformCostModel> frontiers;
+  auto cost = extract::ComputeFrontiers(egraph, UniformCostModel{}, bind_class, frontiers);
+
+  // cyclic_expr has LITERAL(99) as an escape - it resolves, so the Bind enode is NOT
+  // skipped. The Bind enode's cost = 1 (self) + 1 (input) + 1 (sym) + 1 (cyclic_expr LITERAL) = 4.
+  ASSERT_TRUE(cost != nullptr);
+  ASSERT_EQ(cost->cost, 4.0);
+
+  // All children must be cached
+  EXPECT_TRUE(frontiers.frontier_map.contains(input_class));
+  EXPECT_TRUE(frontiers.frontier_map.contains(sym_class));
+  EXPECT_TRUE(frontiers.frontier_map.contains(cyclic_expr)) << "cyclic_expr has a LITERAL escape path - must be cached";
+}
+
+// ========================================
+// Multi-Alt Extraction Tests
+// ========================================
+
+namespace {
+
+// A simple multi-alt cost model for testing.
+// Each alternative has a cost, a set of required "demands" (ints), and the enode_id.
+struct TestDemandAlt {
+  double cost;
+  std::set<int> required;
+  ENodeId enode_id;
+};
+
+/// TestDemandAlt's Pareto dims: lower cost, smaller required-set.
+using TestDim_Cost = extract::Dim<&TestDemandAlt::cost, extract::LowerIsBetter>;
+using TestDim_Required = extract::Dim<&TestDemandAlt::required, extract::SmallerSubsetIsBetter>;
+
+/// TestFrontier: ParetoFrontier with resolve/min_cost for the extraction contract.
+struct TestFrontier : CostResultBase<TestDemandAlt, TestDim_Cost, TestDim_Required> {
+  using CostResultBase::CostResultBase;
+};
+
+// TestDemandAlt has public mutable fields and so satisfies the LazyMap
+// refinement.  An alt with a const `enode_id` data member still satisfies
+// ParetoAlt (only the read expression is required) but fails MutableParetoAlt
+// because the member cannot be assigned to - the named diagnostic LazyMap
+// surfaces at instantiation.
+struct ReadOnlyEnodeIdAlt {
+  struct EnodeIdHolder {
+    ENodeId value{};
+    auto operator=(ENodeId) -> EnodeIdHolder & = delete;
+  };
+
+  double cost;
+  EnodeIdHolder enode_id;
+};
+
+static_assert(extract::ParetoAlt<TestDemandAlt>);
+static_assert(extract::MutableParetoAlt<TestDemandAlt, ENodeId>);
+static_assert(extract::ParetoAlt<ReadOnlyEnodeIdAlt>);
+static_assert(!extract::MutableParetoAlt<ReadOnlyEnodeIdAlt, ENodeId>);
+
+/// Pick the cheapest alt whose required set is a subset of `provided`. Returns
+/// nullptr when no compatible alt exists. Shared by the DAG-resolution tests
+/// below - extracted once because each test re-implementing this lambda hides
+/// the actual variation in resolver behaviour.
+///
+/// NOTE: production `ResolvePlanNode` (egraph_converter.cpp)
+/// throws QueryException on no-match instead of returning nullptr. The tests
+/// below `ASSERT_NE(chosen, nullptr)` to mirror "infeasible" without coupling
+/// to the production exception type. If feasibility logic changes in
+/// production, update both this helper and pick_compatible.
+inline auto PickBestCompatible(TestFrontier const &frontier, std::set<int> const &provided) -> TestDemandAlt const * {
+  TestDemandAlt const *best = nullptr;
+  for (auto const &alt : frontier.alts()) {
+    if (std::ranges::includes(provided, alt.required)) {
+      if (!best || alt.cost < best->cost) best = &alt;
+    }
+  }
+  return best;
+}
+
+// Simple multi-alt cost model: each enode produces a single alternative with cost=1,
+// required={} and the enode_id. This should behave identically to single-best extraction.
+// resolve/min_cost live on TestFrontier (the CostResult type).
+// These models only need to provide operator().
+struct SimpleMultiAltCostModel {
+  using CostResult = TestFrontier;
+
+  static auto operator()(ENode<symbol> const & /*current*/, ENodeId enode_id,
+                         std::span<CostResult const *const> children) -> CostResult {
+    auto child_cost = std::ranges::fold_left(
+        children, 0.0, [](double acc, CostResult const *c) { return acc + c->resolve().second; });
+    return CostResult{{{.cost = 1.0 + child_cost, .required = {}, .enode_id = enode_id}}};
+  }
+};
+
+struct DemandAwareMultiAltCostModel {
+  using CostResult = TestFrontier;
+
+  static auto operator()(ENode<symbol> const &current, ENodeId enode_id, std::span<CostResult const *const> children)
+      -> CostResult {
+    auto child_cost = std::ranges::fold_left(
+        children, 0.0, [](double acc, CostResult const *c) { return acc + c->resolve().second; });
+    if (current.symbol() == symbol::A) {
+      return CostResult{{
+          {.cost = 1.0 + child_cost, .required = {1}, .enode_id = enode_id},
+          {.cost = 2.0 + child_cost, .required = {}, .enode_id = enode_id},
+      }};
+    }
+    return CostResult{{{.cost = 1.0 + child_cost, .required = {}, .enode_id = enode_id}}};
+  }
+};
+
+}  // namespace
+
+// ========================================
+// ParetoFrontier::prune() Direct Tests
+// ========================================
+
+TEST(ParetoFrontier_Prune, EmptyFrontier) {
+  auto frontier = TestFrontier{};
+  ASSERT_TRUE(frontier.alts().empty());
+}
+
+TEST(ParetoFrontier_Prune, SingleElement) {
+  auto frontier = TestFrontier{{{.cost = 5.0, .required = {1}, .enode_id = ENodeId{0}}}};
+  ASSERT_EQ(frontier.alts().size(), 1);
+  ASSERT_EQ(frontier.alts()[0].cost, 5.0);
+}
+
+TEST(ParetoFrontier_Prune, NoneDominated) {
+  // Three Pareto-incomparable alts: lower cost always requires more demands.
+  auto frontier = TestFrontier{{
+      {.cost = 1.0, .required = {1, 2}, .enode_id = ENodeId{0}},  // cheapest, most demands
+      {.cost = 2.0, .required = {1}, .enode_id = ENodeId{1}},     // medium
+      {.cost = 3.0, .required = {}, .enode_id = ENodeId{2}},      // expensive, no demands
+  }};
+  ASSERT_EQ(frontier.alts().size(), 3) << "All three Pareto-incomparable alts should survive";
+}
+
+TEST(ParetoFrontier_Prune, AllDominatedByOne) {
+  // Alt B (cost=1, req={}) dominates both A (cost=2, req={1}) and C (cost=3, req={2}).
+  // dominated_by checks: other.cost <= cost && required ⊇ other.required
+  // A.dominated_by(B): B.cost=1 <= 2 && {1} ⊇ {} → true
+  // C.dominated_by(B): B.cost=1 <= 3 && {2} ⊇ {} → true
+  auto frontier = TestFrontier{{
+      {.cost = 2.0, .required = {1}, .enode_id = ENodeId{0}},  // A: dominated by B
+      {.cost = 1.0, .required = {}, .enode_id = ENodeId{1}},   // B: dominator
+      {.cost = 3.0, .required = {2}, .enode_id = ENodeId{2}},  // C: dominated by B
+  }};
+  ASSERT_EQ(frontier.alts().size(), 1);
+  ASSERT_EQ(frontier.alts()[0].enode_id, ENodeId{1}) << "Only the dominator (B) should survive";
+}
+
+TEST(ParetoFrontier_Prune, DuplicateAlternatives) {
+  // When two alts are Pareto-equivalent (identical cost and required), exactly
+  // one survives prune.  Which one is implementation-defined.
+  auto frontier = TestFrontier{{
+      {.cost = 2.0, .required = {1}, .enode_id = ENodeId{0}},
+      {.cost = 2.0, .required = {1}, .enode_id = ENodeId{1}},
+  }};
+  ASSERT_EQ(frontier.alts().size(), 1);
+  EXPECT_TRUE(frontier.alts()[0].enode_id == ENodeId{0} || frontier.alts()[0].enode_id == ENodeId{1});
+}
+
+TEST(ParetoFrontier_Prune, TransitiveDominance) {
+  // A dominates B, B dominates C. After prune, only A survives.
+  // A: cost=1, req={}
+  // B: cost=2, req={1}    - A dominates B: A.cost<=B.cost && B.req ⊇ A.req → 1<=2 && {1}⊇{} → true
+  // C: cost=3, req={1,2}  - B dominates C: B.cost<=C.cost && C.req ⊇ B.req → 2<=3 && {1,2}⊇{1} → true
+  //                        - A dominates C: 1<=3 && {1,2}⊇{} → true (transitivity)
+  // The break optimization: when i=1 (B) is checked, it gets marked dominated by i=0 (A)
+  // in the i=0 loop, so B is skipped. C is also marked dominated in the i=0 loop.
+  auto frontier = TestFrontier{{
+      {.cost = 1.0, .required = {}, .enode_id = ENodeId{0}},      // A
+      {.cost = 2.0, .required = {1}, .enode_id = ENodeId{1}},     // B
+      {.cost = 3.0, .required = {1, 2}, .enode_id = ENodeId{2}},  // C
+  }};
+  ASSERT_EQ(frontier.alts().size(), 1);
+  ASSERT_EQ(frontier.alts()[0].enode_id, ENodeId{0}) << "Only A should survive (dominates B and C)";
+
+  // Also test with reversed input order to exercise the break optimization path.
+  // When C is at index 0: i=0(C), j=1(B): C.dominated_by(B) → true → dominated[0]=true, break
+  // Then i=1(B), j=2(A): B.dominated_by(A) → true → dominated[1]=true, break
+  // Then i=2(A): survives.
+  auto frontier_reversed = TestFrontier{{
+      {.cost = 3.0, .required = {1, 2}, .enode_id = ENodeId{2}},  // C
+      {.cost = 2.0, .required = {1}, .enode_id = ENodeId{1}},     // B
+      {.cost = 1.0, .required = {}, .enode_id = ENodeId{0}},      // A
+  }};
+  ASSERT_EQ(frontier_reversed.alts().size(), 1);
+  ASSERT_EQ(frontier_reversed.alts()[0].enode_id, ENodeId{0}) << "Only A should survive regardless of input order";
+}
+
+TEST(ParetoFrontier_Prune, TransitiveDominance_AllPermutations) {
+  // A={cost=1,req={}}, B={cost=2,req={1}}, C={cost=3,req={1,2}}
+  // A dominates both B and C. After prune, only A survives regardless of input order.
+  using Alt = TestDemandAlt;
+  Alt A = {.cost = 1.0, .required = {}, .enode_id = ENodeId{0}};
+  Alt B = {.cost = 2.0, .required = {1}, .enode_id = ENodeId{1}};
+  Alt C = {.cost = 3.0, .required = {1, 2}, .enode_id = ENodeId{2}};
+
+  std::array<Alt, 3> elems{A, B, C};
+  std::array<std::array<int, 3>, 6> perms{{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}};
+  for (auto const &perm : perms) {
+    auto frontier = TestFrontier{{elems[perm[0]], elems[perm[1]], elems[perm[2]]}};
+    ASSERT_EQ(frontier.alts().size(), 1) << "permutation " << perm[0] << perm[1] << perm[2];
+    ASSERT_EQ(frontier.alts()[0].enode_id, ENodeId{0}) << "Only A (cost=1, req={}) should survive";
+  }
+}
+
+// ========================================
+// ParetoFrontier::merge_in_place Tests
+// ========================================
+
+TEST(ParetoFrontier_MergeInPlace, CrossDominatedElementsRemoved) {
+  // PF_A has one cheap self-contained alt.  PF_B has two alts, both dominated
+  // by PF_A's alt.  After merge into PF_A, only PF_A's original alt survives.
+  auto pf_a = TestFrontier{{{.cost = 1.0, .required = {}, .enode_id = ENodeId{0}}}};
+  auto pf_b = TestFrontier{{
+      {.cost = 3.0, .required = {}, .enode_id = ENodeId{1}},   // dominated: req same, cost worse
+      {.cost = 2.0, .required = {1}, .enode_id = ENodeId{2}},  // dominated: req bigger, cost worse
+  }};
+  pf_a.merge_in_place(std::move(pf_b));
+  ASSERT_EQ(pf_a.alts().size(), 1);
+  EXPECT_EQ(pf_a.alts()[0].enode_id, ENodeId{0});
+}
+
+TEST(ParetoFrontier_MergeInPlace, IncomparableSurviveBothSides) {
+  // PF_A has a cheap alt with req={1}.  PF_B has a costlier self-contained alt.
+  // Neither dominates the other: PF_A's alt is cheaper but has a larger required
+  // set; PF_B's alt has smaller required set but is costlier.  Both survive.
+  auto pf_a = TestFrontier{{{.cost = 1.0, .required = {1}, .enode_id = ENodeId{0}}}};
+  auto pf_b = TestFrontier{{{.cost = 2.0, .required = {}, .enode_id = ENodeId{1}}}};
+  pf_a.merge_in_place(std::move(pf_b));
+  ASSERT_EQ(pf_a.alts().size(), 2);
+}
+
+TEST(ParetoFrontier_MergeInPlace, OtherDominatesPrefix) {
+  // PF_B has a better alt than PF_A's.  PF_A's original alt is cross-dominated
+  // and must be evicted after the merge.
+  auto pf_a = TestFrontier{{{.cost = 5.0, .required = {1}, .enode_id = ENodeId{0}}}};
+  auto pf_b = TestFrontier{{{.cost = 1.0, .required = {}, .enode_id = ENodeId{1}}}};
+  pf_a.merge_in_place(std::move(pf_b));
+  ASSERT_EQ(pf_a.alts().size(), 1);
+  EXPECT_EQ(pf_a.alts()[0].enode_id, ENodeId{1});
+}
+
+TEST(Extract_MultiAlt, SingleAlternative_BehavesLikeSingleBest) {
+  // Multi-alt with a single alternative per enode should produce the same result
+  // as single-best extraction
+  auto egraph = EGraph<symbol, analysis>{};
+  auto [l1_class, l1_node, l1_new] = egraph.emplace(symbol::A);
+  auto [l2_class, l2_node, l2_new] = egraph.emplace(symbol::B);
+  auto [root_class, root_node, root_new] = egraph.emplace(symbol::A, {l1_class, l2_class});
+
+  auto extracted = TestExtract(egraph, SimpleMultiAltCostModel{}, root_class);
+
+  ASSERT_EQ(extracted.size(), 3);
+  ASSERT_EQ(extracted.back().first, root_class);
+  ASSERT_EQ(extracted.back().second, root_node);
+}
+
+TEST(Extract_MultiAlt, TwoAlternatives_MergeFrontier) {
+  // Two enodes in same eclass producing different alternatives.
+  // A produces {cost=1,req={1}} and {cost=2,req={}}
+  // B produces {cost=1,req={}}
+  // After merge: B's {cost=1,req={}} dominates A's {cost=2,req={}},
+  // and A's {cost=1,req={1}} is non-dominated.
+  // Frontier = [{cost=1,req={1},B}, {cost=1,req={},B}]
+  // Wait - B's alt has cost=1,req={} which dominates A's cost=2,req={}.
+  // A's cost=1,req={1} is not dominated by B's cost=1,req={} because req={1} ⊄ req={}.
+  // Actually, dominated_by checks: other.cost <= cost && required ⊇ other.required
+  // A's {cost=1,req={1}} dominated by B's {cost=1,req={}}? other.cost=1 <= 1 ✓, req={1} ⊇ {} ✓ → YES!
+  // So B's {cost=1,req={}} dominates both of A's alternatives.
+  // Resolved enode should be B.
+  auto egraph = EGraph<symbol, analysis>{};
+  auto [aclass, anode, a_new] = egraph.emplace(symbol::A);
+  auto [bclass, bnode, b_new] = egraph.emplace(symbol::B);
+  auto [root, _] = egraph.merge(aclass, bclass);
+  auto ctx = ProcessingContext<symbol>{};
+  egraph.rebuild(ctx);
+
+  auto extracted = TestExtract(egraph, DemandAwareMultiAltCostModel{}, root);
+
+  ASSERT_EQ(extracted.size(), 1);
+  // B has single alt {cost=1, req={}}, which dominates A's alternatives
+  ASSERT_EQ(extracted[0].second, bnode);
+}
+
+TEST(Extract_MultiAlt, DemandPropagation) {
+  // Parent (B) depends on child (A or B equivalent).
+  // A produces {cost=1,req={1}} and {cost=2,req={}}
+  // B produces {cost=1,req={}}
+  // After merging A and B in child eclass: frontier = [{cost=1,req={},B_node}]
+  // Parent (symbol B, one child): {cost=1+1=2, req={}, parent_node}
+  auto egraph = EGraph<symbol, analysis>{};
+  auto [a_class, a_node, a_new] = egraph.emplace(symbol::A);
+  auto [b_class, b_node, b_new] = egraph.emplace(symbol::B);
+  auto [child_class, _] = egraph.merge(a_class, b_class);
+  auto ctx = ProcessingContext<symbol>{};
+  egraph.rebuild(ctx);
+
+  auto [parent_class, parent_node, parent_new] = egraph.emplace(symbol::B, {child_class});
+
+  auto extracted = TestExtract(egraph, DemandAwareMultiAltCostModel{}, parent_class);
+
+  ASSERT_EQ(extracted.size(), 2);
+  ASSERT_EQ(extracted.back().first, parent_class);
+  ASSERT_EQ(extracted.back().second, parent_node);
+  ASSERT_EQ(extracted[0].second, b_node);
+}
+
+TEST(Extract_MultiAlt, DominatedPruning) {
+  // Test that dominated alternatives are correctly pruned.
+  // Create two equivalent enodes where one strictly dominates the other.
+  // A: {cost=1,req={1}} and {cost=2,req={}} - two alternatives
+  // A (another): {cost=3,req={}} - one alternative
+  // After merge: {cost=1,req={1}}, {cost=2,req={}}, {cost=3,req={}}
+  // {cost=2,req={}} dominates {cost=3,req={}} → pruned
+  // Final: {cost=1,req={1}}, {cost=2,req={}}
+  // Resolve picks min cost: {cost=1,req={1}}
+  auto egraph = EGraph<symbol, analysis>{};
+  auto [a1_class, a1_node, a1_new] = egraph.emplace(symbol::A);  // produces 2 alts
+  auto [a2_class, a2_node, a2_new] = egraph.emplace(symbol::A);  // produces 2 alts
+  // a2 is a separate A node; merge to get both in same eclass
+  auto [merged, _] = egraph.merge(a1_class, a2_class);
+  auto ctx = ProcessingContext<symbol>{};
+  egraph.rebuild(ctx);
+
+  // The frontier should have: from a1: {1,{1}},{2,{}} and from a2: {1,{1}},{2,{}}
+  // After Pareto pruning, effectively 2 unique alternatives
+  FrontierContext<DemandAwareMultiAltCostModel::CostResult> frontier_ctx;
+  (void)extract::ComputeFrontiers(egraph, DemandAwareMultiAltCostModel{}, merged, frontier_ctx);
+
+  auto it = frontier_ctx.frontier_map.find(merged);
+  ASSERT_NE(it, frontier_ctx.frontier_map.end());
+  ASSERT_TRUE(it->second.has_value());
+  auto const &frontier = *it->second;
+  // After pruning, exactly 2 non-dominated alternatives should survive:
+  //   {cost=1, required={1}} and {cost=2, required={}}
+  ASSERT_EQ(frontier.alts().size(), 2);
+
+  // Verify both specific alternatives are present
+  auto has_demand_alt = std::ranges::any_of(
+      frontier.alts(), [](auto const &alt) { return alt.cost == 1.0 && alt.required == std::set<int>{1}; });
+  auto has_no_demand_alt =
+      std::ranges::any_of(frontier.alts(), [](auto const &alt) { return alt.cost == 2.0 && alt.required.empty(); });
+  ASSERT_TRUE(has_demand_alt) << "Expected alternative with cost=1.0, required={1}";
+  ASSERT_TRUE(has_no_demand_alt) << "Expected alternative with cost=2.0, required={}";
+
+  // Min cost is 1.0 (the {1}-requiring alternative)
+  ASSERT_DOUBLE_EQ(frontier.resolve().second, 1.0);
+}
+
+TEST(Extract_MultiAlt, DiamondDAG_WithDemand) {
+  // Diamond DAG where a shared eclass is referenced by two parents.
+  // Shared (symbol A) produces two alternatives: {cost=1,req={1}} and {cost=2,req={}}.
+  // Left and Right (symbol B) each reference Shared as a child.
+  // Root (symbol B) references Left and Right.
+  //
+  // The shared eclass should be extracted once, and the correct alternative
+  // selected based on demand resolution.
+  auto egraph = EGraph<symbol, analysis>{};
+  auto [shared_class, shared_node, shared_new] = egraph.emplace(symbol::A);
+  auto [left_class, left_node, left_new] = egraph.emplace(symbol::B, {shared_class}, 1);     // disambiguator = 1
+  auto [right_class, right_node, right_new] = egraph.emplace(symbol::B, {shared_class}, 2);  // disambiguator = 2
+  auto [root_class, root_node, root_new] = egraph.emplace(symbol::B, {left_class, right_class});
+
+  auto extracted = TestExtract(egraph, DemandAwareMultiAltCostModel{}, root_class);
+
+  ASSERT_EQ(extracted.size(), 4);
+  ASSERT_EQ(extracted.back().first, root_class);
+  ASSERT_EQ(extracted.back().second, root_node);
+  ASSERT_EQ(extracted[0].first, shared_class);
+  ASSERT_EQ(extracted[0].second, shared_node);
+
+  // Verify shared eclass appears exactly once (not duplicated for each parent)
+  auto shared_count = std::ranges::count_if(extracted, [&](auto const &p) { return p.first == shared_class; });
+  ASSERT_EQ(shared_count, 1);
+}
+
+TEST(Extract_MultiAlt, ThreeNonDominatedAlternatives) {
+  // Create a cost model that produces 3 Pareto-incomparable alternatives.
+  // Use symbol C and D to produce alternatives with different cost/demand tradeoffs.
+  // We define a custom cost model inline.
+  struct ThreeAltCostModel {
+    using CostResult = TestFrontier;
+
+    static auto operator()(ENode<symbol> const &current, ENodeId enode_id, std::span<CostResult const *const> children)
+        -> CostResult {
+      auto child_cost = std::ranges::fold_left(
+          children, 0.0, [](double acc, CostResult const *c) { return acc + c->resolve().second; });
+      if (current.symbol() == symbol::A) {
+        return CostResult{{
+            {.cost = 1.0 + child_cost, .required = {1, 2}, .enode_id = enode_id},
+            {.cost = 2.0 + child_cost, .required = {1}, .enode_id = enode_id},
+            {.cost = 3.0 + child_cost, .required = {}, .enode_id = enode_id},
+        }};
+      }
+      return CostResult{{{.cost = 1.0 + child_cost, .required = {}, .enode_id = enode_id}}};
+    }
+  };
+
+  auto egraph = EGraph<symbol, analysis>{};
+  auto [a_class, a_node, a_new] = egraph.emplace(symbol::A);
+
+  // Directly compute frontiers to inspect the Pareto set
+  FrontierContext<ThreeAltCostModel::CostResult> frontier_ctx;
+  (void)extract::ComputeFrontiers(egraph, ThreeAltCostModel{}, a_class, frontier_ctx);
+
+  auto it = frontier_ctx.frontier_map.find(a_class);
+  ASSERT_NE(it, frontier_ctx.frontier_map.end());
+  ASSERT_TRUE(it->second.has_value());
+  auto const &frontier = *it->second;
+
+  // All 3 alternatives are Pareto-incomparable: none dominates another
+  ASSERT_EQ(frontier.alts().size(), 3);
+
+  // Verify each specific alternative is present
+  auto has_alt_1_2 = std::ranges::any_of(
+      frontier.alts(), [](auto const &alt) { return alt.cost == 1.0 && alt.required == std::set<int>{1, 2}; });
+  auto has_alt_1 = std::ranges::any_of(
+      frontier.alts(), [](auto const &alt) { return alt.cost == 2.0 && alt.required == std::set<int>{1}; });
+  auto has_alt_none =
+      std::ranges::any_of(frontier.alts(), [](auto const &alt) { return alt.cost == 3.0 && alt.required.empty(); });
+  ASSERT_TRUE(has_alt_1_2) << "Expected alternative with cost=1.0, required={1,2}";
+  ASSERT_TRUE(has_alt_1) << "Expected alternative with cost=2.0, required={1}";
+  ASSERT_TRUE(has_alt_none) << "Expected alternative with cost=3.0, required={}";
+
+  // Min cost should be 1.0
+  ASSERT_DOUBLE_EQ(frontier.resolve().second, 1.0);
+
+  // Full extraction should still work and select the min-cost alternative
+  auto extracted = TestExtract(egraph, ThreeAltCostModel{}, a_class);
+  ASSERT_EQ(extracted.size(), 1);
+  ASSERT_EQ(extracted[0].second, a_node);
+}
+
+// Invariant: when a DAG-shared eclass is reached from contexts with
+// different provided sets, the final selection must be feasible for every
+// visiting context, not just the first one.
+//
+// Diamond DAG: Root → Left, Right; both depend on Shared (symbol A) whose
+// frontier has two non-dominated alts: {cost=1, req={1}} and {cost=2, req={}}.
+// Left visits Shared with provided={1}; Right with provided={}. The
+// conservative {cost=2, req={}} is the only alt feasible for both.
+TEST(Extract_MultiAlt, DAGResolution_FirstVisitorWins) {
+  auto egraph = EGraph<symbol, analysis>{};
+  auto [shared_class, shared_node, shared_new] = egraph.emplace(symbol::A);
+  auto [left_class, left_node, left_new] = egraph.emplace(symbol::B, {shared_class}, 1);
+  auto [right_class, right_node, right_new] = egraph.emplace(symbol::B, {shared_class}, 2);
+  auto [root_class, root_node, root_new] = egraph.emplace(symbol::B, {left_class, right_class});
+
+  // Compute frontiers bottom-up
+  using CM = DemandAwareMultiAltCostModel;
+  FrontierContext<CM::CostResult> frontier_ctx;
+  (void)extract::ComputeFrontiers(egraph, CM{}, root_class, frontier_ctx);
+
+  // Verify shared eclass has both non-dominated alternatives
+  auto const &shared_frontier = *frontier_ctx.frontier_map.at(shared_class);
+  ASSERT_EQ(shared_frontier.alts().size(), 2);
+
+  // Context-aware resolver: when a cached eclass is revisited under a tighter
+  // context than the one originally cached, re-resolve to a compatible alt.
+  auto resolved = std::unordered_map<EClassId, std::pair<ENodeId, double>>{};
+  auto resolved_required = std::unordered_map<EClassId, std::set<int>>{};
+
+  // DFS resolver where the Root node provides different contexts per child:
+  //   Left child gets provided={1} (mimics alive Bind providing a symbol)
+  //   Right child gets provided={} (no extra symbols)
+  auto resolve = [&](this auto const &self, EClassId id, std::set<int> const &provided) -> void {
+    if (auto existing = resolved.find(id); existing != resolved.end()) {
+      // DAG re-visit: check if cached selection is compatible with this context
+      if (std::ranges::includes(provided, resolved_required[id])) return;  // still feasible
+      // Incompatible: re-resolve with more restrictive provided
+      auto const &frontier = *frontier_ctx.frontier_map.at(id);
+      auto const *chosen = PickBestCompatible(frontier, provided);
+      ASSERT_NE(chosen, nullptr);
+      existing->second = {chosen->enode_id, chosen->cost};
+      resolved_required[id] = chosen->required;
+      return;
+    }
+    auto const &frontier = *frontier_ctx.frontier_map.at(id);
+    auto const *chosen = PickBestCompatible(frontier, provided);
+    ASSERT_NE(chosen, nullptr);
+    resolved[id] = {chosen->enode_id, chosen->cost};
+    resolved_required[id] = chosen->required;
+    auto const &enode = egraph.get_enode(chosen->enode_id);
+    auto const &children = enode.children();
+
+    if (id == root_class && children.size() == 2) {
+      // Root provides different contexts per child (like an Output with alive Bind + NamedOutput)
+      self(children[0], {1});  // Left child: provided={1}
+      self(children[1], {});   // Right child: provided={}
+    } else {
+      for (auto child : children) {
+        self(child, provided);
+      }
+    }
+  };
+
+  resolve(root_class, {});
+
+  // The final selection must be the conservative no-demand alt (req={}),
+  // feasible for every visiting context.
+  auto const &[shared_enode, shared_cost] = resolved.at(shared_class);
+  ASSERT_EQ(shared_cost, 2.0);
+  ASSERT_TRUE(resolved_required[shared_class].empty());
+}
+
+TEST(Extract_MultiAlt, DAGResolution_CascadesToChildren) {
+  // Invariant: when a shared eclass is re-resolved under a stricter
+  // `provided` context, the new selection's transitive children must also be
+  // re-resolved under that context. Otherwise children keep selections made
+  // under the original (broader) context.
+  //
+  // 3-level diamond: Root -> Left, Right -> Shared(A, {Leaf}) -> Leaf.
+  // Both Shared and Leaf have demand-aware alts {req={1}} and {req={}}.
+  // First DFS branch picks the cheap req={1} alts; second branch
+  // (provided={}) re-resolves Shared to req={} and must cascade to Leaf.
+  auto egraph = EGraph<symbol, analysis>{};
+  auto [leaf_class, leaf_node, leaf_new] = egraph.emplace(symbol::A);
+  auto [shared_class, shared_node, shared_new] = egraph.emplace(symbol::A, {leaf_class});
+  auto [left_class, left_node, left_new] = egraph.emplace(symbol::B, {shared_class}, 1);
+  auto [right_class, right_node, right_new] = egraph.emplace(symbol::B, {shared_class}, 2);
+  auto [root_class, root_node, root_new] = egraph.emplace(symbol::B, {left_class, right_class});
+
+  using CM = DemandAwareMultiAltCostModel;
+  FrontierContext<CM::CostResult> frontier_ctx;
+  (void)extract::ComputeFrontiers(egraph, CM{}, root_class, frontier_ctx);
+
+  ASSERT_EQ(frontier_ctx.frontier_map.at(shared_class)->alts().size(), 2);
+  ASSERT_EQ(frontier_ctx.frontier_map.at(leaf_class)->alts().size(), 2);
+
+  auto resolved = std::unordered_map<EClassId, std::pair<ENodeId, double>>{};
+  auto resolved_required = std::unordered_map<EClassId, std::set<int>>{};
+
+  auto resolve = [&](this auto const &self, EClassId id, std::set<int> const &provided) -> void {
+    if (auto existing = resolved.find(id); existing != resolved.end()) {
+      if (std::ranges::includes(provided, resolved_required[id])) return;
+      auto const &frontier = *frontier_ctx.frontier_map.at(id);
+      auto const *chosen = PickBestCompatible(frontier, provided);
+      ASSERT_NE(chosen, nullptr);
+      existing->second = std::pair{chosen->enode_id, chosen->cost};
+      resolved_required[id] = chosen->required;
+      auto const &enode = egraph.get_enode(chosen->enode_id);
+      for (auto child : enode.children()) {
+        self(child, provided);
+      }
+      return;
+    }
+    auto const &frontier = *frontier_ctx.frontier_map.at(id);
+    auto const *chosen = PickBestCompatible(frontier, provided);
+    ASSERT_NE(chosen, nullptr);
+    resolved[id] = std::pair{chosen->enode_id, chosen->cost};
+    resolved_required[id] = chosen->required;
+    auto const &enode = egraph.get_enode(chosen->enode_id);
+    auto const &children = enode.children();
+    if (id == root_class && children.size() == 2) {
+      self(children[0], {1});
+      self(children[1], {});
+    } else {
+      for (auto child : children) {
+        self(child, provided);
+      }
+    }
+  };
+
+  resolve(root_class, {});
+
+  // Shared was re-resolved to req={} on the right branch; the cascade must
+  // re-resolve Leaf under {} too, swapping it onto the {cost=2, req={}} alt.
+  ASSERT_TRUE(resolved_required[shared_class].empty());
+  ASSERT_EQ(resolved.at(leaf_class).second, 2.0);
+  ASSERT_TRUE(resolved_required[leaf_class].empty());
+}
+
+// Tests that when a cascade re-resolve switches a Bind-like node from alive to dead,
+// stale sym/expr children are erased from the resolved map. Without the erase, the
+// Builder would see the stale entries and treat the dead Bind as alive.
+TEST(Extract_MultiAlt, DAGResolution_AliveToDeadErasesStaleChildren) {
+  // 4-level structure simulating a Bind with sym and expr children:
+  //   Root(B) → Left(B, {BindLike}), Right(B, {BindLike})
+  //   BindLike(A, {Input, Sym, Expr})
+  //   Input(B), Sym(B), Expr(B) - all leaves
+  //
+  // DemandAwareMultiAltCostModel: A produces {cost=1,req={1}} and {cost=2,req={}}.
+  // Left provides {1} → BindLike picks req={1} → all 3 children resolved.
+  // Right provides {} → BindLike re-resolves to req={} → Sym/Expr should be ERASED.
+  auto egraph = EGraph<symbol, analysis>{};
+  auto [input_class, input_node, input_new] = egraph.emplace(symbol::B);
+  auto [sym_class, sym_node, sym_new] = egraph.emplace(symbol::B, {}, 1);
+  auto [expr_class, expr_node, expr_new] = egraph.emplace(symbol::B, {}, 2);
+  auto [bind_class, bind_node, bind_new] = egraph.emplace(symbol::A, {input_class, sym_class, expr_class});
+  auto [left_class, left_node, left_new] = egraph.emplace(symbol::B, {bind_class}, 3);
+  auto [right_class, right_node, right_new] = egraph.emplace(symbol::B, {bind_class}, 4);
+  auto [root_class, root_node, root_new] = egraph.emplace(symbol::B, {left_class, right_class});
+
+  using CM = DemandAwareMultiAltCostModel;
+  FrontierContext<CM::CostResult> frontier_ctx;
+  (void)extract::ComputeFrontiers(egraph, CM{}, root_class, frontier_ctx);
+
+  auto resolved = std::unordered_map<EClassId, std::pair<ENodeId, double>>{};
+  auto resolved_required = std::unordered_map<EClassId, std::set<int>>{};
+
+  auto resolve = [&](this auto const &self, EClassId id, std::set<int> const &provided) -> void {
+    if (auto existing = resolved.find(id); existing != resolved.end()) {
+      if (std::ranges::includes(provided, resolved_required[id])) return;
+      auto const &frontier = *frontier_ctx.frontier_map.at(id);
+      auto const *chosen = PickBestCompatible(frontier, provided);
+      ASSERT_NE(chosen, nullptr);
+      existing->second = std::pair{chosen->enode_id, chosen->cost};
+      resolved_required[id] = chosen->required;
+      // Cascade + erase stale children if switching to no-demand alt
+      auto const &enode = egraph.get_enode(chosen->enode_id);
+      if (chosen->required.empty() && enode.children().size() == 3) {
+        // Dead-like: only visit first child, erase second and third
+        resolved.erase(enode.children()[1]);
+        resolved.erase(enode.children()[2]);
+        resolved_required.erase(enode.children()[1]);
+        resolved_required.erase(enode.children()[2]);
+        self(enode.children()[0], provided);
+      } else {
+        for (auto child : enode.children()) {
+          self(child, provided);
+        }
+      }
+      return;
+    }
+    auto const &frontier = *frontier_ctx.frontier_map.at(id);
+    auto const *chosen = PickBestCompatible(frontier, provided);
+    ASSERT_NE(chosen, nullptr);
+    resolved[id] = std::pair{chosen->enode_id, chosen->cost};
+    resolved_required[id] = chosen->required;
+    auto const &enode = egraph.get_enode(chosen->enode_id);
+    if (id == root_class && enode.children().size() == 2) {
+      self(enode.children()[0], {1});  // Left provides {1}
+      self(enode.children()[1], {});   // Right provides {}
+    } else {
+      for (auto child : enode.children()) {
+        self(child, provided);
+      }
+    }
+  };
+
+  resolve(root_class, {});
+
+  // BindLike was first resolved as alive (req={1}), then re-resolved as dead (req={}).
+  // After re-resolve, sym and expr should be ERASED from resolved.
+  ASSERT_TRUE(resolved_required[bind_class].empty()) << "BindLike should be re-resolved to no-demand";
+  ASSERT_FALSE(resolved.contains(sym_class)) << "Stale sym should be erased on alive→dead transition";
+  ASSERT_FALSE(resolved.contains(expr_class)) << "Stale expr should be erased on alive→dead transition";
+  // Input should still be resolved
+  ASSERT_TRUE(resolved.contains(input_class));
+}
+
+// Cascade re-resolution must propagate through plain intermediate operators,
+// not just stop one level deep at the first re-resolved node.
+TEST(Extract_MultiAlt, DAGResolution_CascadeTraversesIntermediate) {
+  // 4-level chain feeding a diamond:
+  //   Root(B) -> {Left(B,1), Right(B,2)} -> Shared -> Mid -> Leaf
+  // Shared, Mid, Leaf each have demand-aware {req={1}} and {req={}} alts.
+  // Left visits with provided={1} → all three pick the cheap req={1} alt.
+  // Right visits with provided={} → Shared re-resolves to req={}, and the
+  // cascade must reach Mid and Leaf so they too move to req={}; otherwise
+  // a stale {req={1}} would be left at a node no ancestor satisfies.
+  auto egraph = EGraph<symbol, analysis>{};
+  auto [leaf_class, leaf_node, leaf_new] = egraph.emplace(symbol::A);
+  auto [mid_class, mid_node, mid_new] = egraph.emplace(symbol::A, {leaf_class});
+  auto [shared_class, shared_node, shared_new] = egraph.emplace(symbol::A, {mid_class});
+  auto [left_class, left_node, left_new] = egraph.emplace(symbol::B, {shared_class}, 1);
+  auto [right_class, right_node, right_new] = egraph.emplace(symbol::B, {shared_class}, 2);
+  auto [root_class, root_node, root_new] = egraph.emplace(symbol::B, {left_class, right_class});
+
+  using CM = DemandAwareMultiAltCostModel;
+  FrontierContext<CM::CostResult> frontier_ctx;
+  (void)extract::ComputeFrontiers(egraph, CM{}, root_class, frontier_ctx);
+
+  ASSERT_EQ(frontier_ctx.frontier_map.at(shared_class)->alts().size(), 2);
+  ASSERT_EQ(frontier_ctx.frontier_map.at(mid_class)->alts().size(), 2);
+  ASSERT_EQ(frontier_ctx.frontier_map.at(leaf_class)->alts().size(), 2);
+
+  auto resolved = std::unordered_map<EClassId, std::pair<ENodeId, double>>{};
+  auto resolved_required = std::unordered_map<EClassId, std::set<int>>{};
+
+  auto resolve = [&](this auto const &self, EClassId id, std::set<int> const &provided) -> void {
+    if (auto existing = resolved.find(id); existing != resolved.end()) {
+      if (std::ranges::includes(provided, resolved_required[id])) return;
+      auto const &frontier = *frontier_ctx.frontier_map.at(id);
+      auto const *chosen = PickBestCompatible(frontier, provided);
+      ASSERT_NE(chosen, nullptr);
+      existing->second = std::pair{chosen->enode_id, chosen->cost};
+      resolved_required[id] = chosen->required;
+      auto const &enode = egraph.get_enode(chosen->enode_id);
+      for (auto child : enode.children()) {
+        self(child, provided);
+      }
+      return;
+    }
+    auto const &frontier = *frontier_ctx.frontier_map.at(id);
+    auto const *chosen = PickBestCompatible(frontier, provided);
+    ASSERT_NE(chosen, nullptr);
+    resolved[id] = std::pair{chosen->enode_id, chosen->cost};
+    resolved_required[id] = chosen->required;
+    auto const &enode = egraph.get_enode(chosen->enode_id);
+    auto const &children = enode.children();
+    if (id == root_class && children.size() == 2) {
+      self(children[0], {1});
+      self(children[1], {});
+    } else {
+      for (auto child : children) {
+        self(child, provided);
+      }
+    }
+  };
+
+  resolve(root_class, {});
+
+  ASSERT_TRUE(resolved_required[shared_class].empty());
+  ASSERT_TRUE(resolved_required[mid_class].empty()) << "cascade must reach intermediate";
+  ASSERT_TRUE(resolved_required[leaf_class].empty()) << "cascade must reach grandchild leaf";
+}
+
+TEST(Extract_MultiAlt, CyclicEClass) {
+  // Multi-alt should handle cycles the same as single-best: skip cyclic enodes
+  auto egraph = EGraph<symbol, analysis>{};
+  auto [x_class, x_node, x_new] = egraph.emplace(symbol::LITERAL, 1);
+  auto [zero_class, zero_node, zero_new] = egraph.emplace(symbol::LITERAL, 0);
+  auto [plus_class, plus_node, plus_new] = egraph.emplace(symbol::ADD, {x_class, zero_class});
+  auto [cyclic_class, _] = egraph.merge(x_class, plus_class);
+  auto ctx = ProcessingContext<symbol>{};
+  egraph.rebuild(ctx);
+
+  auto extracted = TestExtract(egraph, SimpleMultiAltCostModel{}, cyclic_class);
+
+  // Should select the non-cyclic LITERAL node
+  ASSERT_EQ(extracted.size(), 1);
+  ASSERT_EQ(extracted[0].second, x_node);
 }
