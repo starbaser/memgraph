@@ -575,7 +575,9 @@ granularPrivilegeList : granularPrivilege ( ',' granularPrivilege )* ;
 
 entityPrivilegeList : entityPrivilege ( ',' entityPrivilege )* ;
 
-entityPrivilege : granularPrivilegeList ON entityTypeSpec ;
+entityPrivilege : granularPrivilegeList propertyPrivilegeList? ON entityTypeSpec ;
+
+propertyPrivilegeList : '{' ( ASTERISK | listOfSymbolicNames ) '}' ;
 
 entityTypeSpec
     : NODES CONTAINING LABELS labelEntities=labelEntitiesList matchingClause?
