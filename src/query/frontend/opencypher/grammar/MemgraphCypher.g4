@@ -334,9 +334,9 @@ authQuery : createRole
           | setMainDatabase
           | grantImpersonateUser
           | denyImpersonateUser
-          | grantPropertyPrivilege
-          | denyPropertyPrivilege
-          | revokePropertyPrivilege
+          | grantPropertyPermission
+          | denyPropertyPermission
+          | revokePropertyPermission
           ;
 
 replicationQuery : setReplicationRole
@@ -529,7 +529,7 @@ grantImpersonateUser : GRANT IMPERSONATE_USER targets=wildcardListOfSymbolicName
 
 denyImpersonateUser : DENY IMPERSONATE_USER targets=wildcardListOfSymbolicNames TO target=userOrRole ;
 
-propertyPrivilegeList : '{' ( ASTERISK | listOfSymbolicNames ) '}' ;
+propertyPermissionList : '{' ( ASTERISK | listOfSymbolicNames ) '}' ;
 
 propertyEntityTarget
     : NODES entity=symbolicName
@@ -541,11 +541,11 @@ propertyScope
     | ON propertyEntityTarget
     ;
 
-grantPropertyPrivilege : GRANT READ propList=propertyPrivilegeList propertyScope TO target=userOrRole ;
+grantPropertyPermission : GRANT READ propList=propertyPermissionList propertyScope TO target=userOrRole ;
 
-denyPropertyPrivilege : DENY READ propList=propertyPrivilegeList propertyScope TO target=userOrRole ;
+denyPropertyPermission : DENY READ propList=propertyPermissionList propertyScope TO target=userOrRole ;
 
-revokePropertyPrivilege : REVOKE READ propList=propertyPrivilegeList propertyScope FROM target=userOrRole ;
+revokePropertyPermission : REVOKE READ propList=propertyPermissionList propertyScope FROM target=userOrRole ;
 
 grantDatabaseToUserOrRole : GRANT DATABASE db=wildcardName TO target=userOrRole ;
 
