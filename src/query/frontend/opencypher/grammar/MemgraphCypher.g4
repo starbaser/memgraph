@@ -172,6 +172,7 @@ memgraphCypherKeyword : cypherKeyword
                       | REPLACE
                       | REPLICA
                       | REPLICAS
+                      | RELATIONSHIPS
                       | REPLICATION
                       | REQUIRE
                       | RESET
@@ -333,6 +334,9 @@ authQuery : createRole
           | setMainDatabase
           | grantImpersonateUser
           | denyImpersonateUser
+          | grantPropertyPrivilege
+          | denyPropertyPrivilege
+          | revokePropertyPrivilege
           ;
 
 replicationQuery : setReplicationRole
@@ -525,6 +529,24 @@ grantImpersonateUser : GRANT IMPERSONATE_USER targets=wildcardListOfSymbolicName
 
 denyImpersonateUser : DENY IMPERSONATE_USER targets=wildcardListOfSymbolicNames TO target=userOrRole ;
 
+propertyPrivilegeList : '{' ( ASTERISK | listOfSymbolicNames ) '}' ;
+
+propertyEntityTarget
+    : NODES entity=symbolicName
+    | RELATIONSHIPS entity=symbolicName
+    ;
+
+propertyScope
+    : ON GRAPH graph=symbolicName propertyEntityTarget
+    | ON propertyEntityTarget
+    ;
+
+grantPropertyPrivilege : GRANT READ propList=propertyPrivilegeList propertyScope TO target=userOrRole ;
+
+denyPropertyPrivilege : DENY READ propList=propertyPrivilegeList propertyScope TO target=userOrRole ;
+
+revokePropertyPrivilege : REVOKE READ propList=propertyPrivilegeList propertyScope FROM target=userOrRole ;
+
 grantDatabaseToUserOrRole : GRANT DATABASE db=wildcardName TO target=userOrRole ;
 
 denyDatabaseFromUserOrRole : DENY DATABASE db=wildcardName FROM target=userOrRole ;
@@ -575,9 +597,7 @@ granularPrivilegeList : granularPrivilege ( ',' granularPrivilege )* ;
 
 entityPrivilegeList : entityPrivilege ( ',' entityPrivilege )* ;
 
-entityPrivilege : granularPrivilegeList propertyPrivilegeList? ON entityTypeSpec ;
-
-propertyPrivilegeList : '{' ( ASTERISK | listOfSymbolicNames ) '}' ;
+entityPrivilege : granularPrivilegeList ON entityTypeSpec ;
 
 entityTypeSpec
     : NODES CONTAINING LABELS labelEntities=labelEntitiesList matchingClause?
