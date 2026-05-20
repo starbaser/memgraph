@@ -2812,8 +2812,8 @@ struct AuthQueryChecker {
     return *this;
   }
 
-  AuthQueryChecker &WithPropertyEntityIsNode(bool is_node) {
-    property_entity_is_node_ = is_node;
+  AuthQueryChecker &WithPropertyEntityType(AuthQuery::PropertyEntityType type) {
+    property_entity_type_ = type;
     return *this;
   }
 
@@ -2837,7 +2837,7 @@ struct AuthQueryChecker {
     }
     EXPECT_EQ(q->property_privileges_, property_privileges_);
     EXPECT_EQ(q->property_entity_name_, property_entity_name_);
-    EXPECT_EQ(q->property_entity_is_node_, property_entity_is_node_);
+    EXPECT_EQ(q->property_entity_type_, property_entity_type_);
   }
 
  private:
@@ -2855,7 +2855,7 @@ struct AuthQueryChecker {
   std::optional<std::unordered_set<std::string>> role_databases_;
   std::vector<std::string> property_privileges_;
   std::string property_entity_name_;
-  bool property_entity_is_node_{true};
+  AuthQuery::PropertyEntityType property_entity_type_{AuthQuery::PropertyEntityType::NODE};
 };
 
 TEST_P(CypherMainVisitorTest, UserOrRoleName) {
@@ -4440,7 +4440,7 @@ TEST_P(CypherMainVisitorTest, GrantPropertyReadPrivilege) {
       .WithUserOrRole("user")
       .WithPropertyPrivileges({"ssn"})
       .WithPropertyEntityName("Employee")
-      .WithPropertyEntityIsNode(true)
+      .WithPropertyEntityType(AuthQuery::PropertyEntityType::NODE)
       .Check();
 
   // GRANT READ with multiple properties on nodes
@@ -4450,7 +4450,7 @@ TEST_P(CypherMainVisitorTest, GrantPropertyReadPrivilege) {
       .WithUserOrRole("user")
       .WithPropertyPrivileges({"ssn", "salary", "dob"})
       .WithPropertyEntityName("Employee")
-      .WithPropertyEntityIsNode(true)
+      .WithPropertyEntityType(AuthQuery::PropertyEntityType::NODE)
       .Check();
 
   // GRANT READ with wildcard properties on nodes
@@ -4459,7 +4459,7 @@ TEST_P(CypherMainVisitorTest, GrantPropertyReadPrivilege) {
       .WithUserOrRole("user")
       .WithPropertyPrivileges({"*"})
       .WithPropertyEntityName("Employee")
-      .WithPropertyEntityIsNode(true)
+      .WithPropertyEntityType(AuthQuery::PropertyEntityType::NODE)
       .Check();
 
   // GRANT READ with properties on relationships
@@ -4469,7 +4469,7 @@ TEST_P(CypherMainVisitorTest, GrantPropertyReadPrivilege) {
       .WithUserOrRole("user")
       .WithPropertyPrivileges({"amount", "currency"})
       .WithPropertyEntityName("PAID")
-      .WithPropertyEntityIsNode(false)
+      .WithPropertyEntityType(AuthQuery::PropertyEntityType::RELATIONSHIP)
       .Check();
 
   // GRANT READ with ON GRAPH (graph name parsed but ignored)
@@ -4479,7 +4479,7 @@ TEST_P(CypherMainVisitorTest, GrantPropertyReadPrivilege) {
       .WithUserOrRole("user")
       .WithPropertyPrivileges({"ssn"})
       .WithPropertyEntityName("Employee")
-      .WithPropertyEntityIsNode(true)
+      .WithPropertyEntityType(AuthQuery::PropertyEntityType::NODE)
       .Check();
 }
 
@@ -4491,7 +4491,7 @@ TEST_P(CypherMainVisitorTest, DenyPropertyReadPrivilege) {
       .WithUserOrRole("user")
       .WithPropertyPrivileges({"ssn"})
       .WithPropertyEntityName("Employee")
-      .WithPropertyEntityIsNode(true)
+      .WithPropertyEntityType(AuthQuery::PropertyEntityType::NODE)
       .Check();
 
   AuthQueryChecker(
@@ -4499,7 +4499,7 @@ TEST_P(CypherMainVisitorTest, DenyPropertyReadPrivilege) {
       .WithUserOrRole("user")
       .WithPropertyPrivileges({"amount"})
       .WithPropertyEntityName("PAID")
-      .WithPropertyEntityIsNode(false)
+      .WithPropertyEntityType(AuthQuery::PropertyEntityType::RELATIONSHIP)
       .Check();
 }
 
@@ -4511,7 +4511,7 @@ TEST_P(CypherMainVisitorTest, RevokePropertyReadPrivilege) {
       .WithUserOrRole("user")
       .WithPropertyPrivileges({"ssn"})
       .WithPropertyEntityName("Employee")
-      .WithPropertyEntityIsNode(true)
+      .WithPropertyEntityType(AuthQuery::PropertyEntityType::NODE)
       .Check();
 
   AuthQueryChecker(&ast_generator,
@@ -4520,7 +4520,7 @@ TEST_P(CypherMainVisitorTest, RevokePropertyReadPrivilege) {
       .WithUserOrRole("user")
       .WithPropertyPrivileges({"amount"})
       .WithPropertyEntityName("PAID")
-      .WithPropertyEntityIsNode(false)
+      .WithPropertyEntityType(AuthQuery::PropertyEntityType::RELATIONSHIP)
       .Check();
 }
 
