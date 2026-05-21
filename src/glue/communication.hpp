@@ -1,4 +1,4 @@
-// Copyright 2025 Memgraph Ltd.
+// Copyright 2026 Memgraph Ltd.
 //
 // Use of this software is governed by the Business Source License
 // included in the file licenses/BSL.txt; by using this file, you agree to be bound by the terms of the Business Source
@@ -17,6 +17,10 @@
 #include "storage/v2/property_value.hpp"
 #include "storage/v2/view.hpp"
 
+namespace memgraph::query {
+class FineGrainedAuthChecker;
+}  // namespace memgraph::query
+
 namespace memgraph::storage {
 class EdgeAccessor;
 class Storage;
@@ -32,7 +36,8 @@ namespace memgraph::glue {
 ///
 /// @throw std::bad_alloc
 storage::Result<communication::bolt::Vertex> ToBoltVertex(const storage::VertexAccessor &vertex,
-                                                          const storage::Storage &db, storage::View view);
+                                                          const storage::Storage &db, storage::View view,
+                                                          query::FineGrainedAuthChecker const *auth_checker = nullptr);
 
 /// @param storage::EdgeAccessor for converting to communication::bolt::Edge.
 /// @param storage::Storage for getting edge type and property names.
@@ -40,7 +45,8 @@ storage::Result<communication::bolt::Vertex> ToBoltVertex(const storage::VertexA
 ///
 /// @throw std::bad_alloc
 storage::Result<communication::bolt::Edge> ToBoltEdge(const storage::EdgeAccessor &edge, const storage::Storage &db,
-                                                      storage::View view);
+                                                      storage::View view,
+                                                      query::FineGrainedAuthChecker const *auth_checker = nullptr);
 
 /// @param query::Path for converting to communication::bolt::Path.
 /// @param storage::Storage for ToBoltVertex and ToBoltEdge.
