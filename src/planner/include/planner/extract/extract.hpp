@@ -88,6 +88,10 @@ struct ResolvedBuildContext {
            "CSR child slice out of range");
     return std::span(child_indices).subspan(entry.children.begin, entry.children.count);
   }
+
+  /// The resolver's entries in children-before-parents order.  A `children_of`
+  /// slot is an index into this sequence.
+  [[nodiscard]] auto resolved_entries() const -> std::span<ResolvedEntry const> { return build_order; }
 };
 
 /// Reusable scratch for the `Extract` pipeline.  `clear()` preserves

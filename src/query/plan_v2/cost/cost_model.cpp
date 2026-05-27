@@ -66,6 +66,14 @@ inline constexpr double kParamLookupLeaf = 1.0;
 // shape.  Row-pipe operators (Output, Unwind, Subquery) override cardinality
 // inside their dedicated helper.
 
+/// Demand satisfaction: do `provider`'s available bindings cover what
+/// `demander` reads?  The recurring check when composing an expression Alt
+/// (a Bind/Unwind expr, an Output NamedOutput) onto an input Alt.  A
+/// combination that fails this cannot form a satisfiable plan and is skipped.
+[[nodiscard]] auto DemandMet(Alternative const &provider, Alternative const &demander) -> bool {
+  return demander.required.is_subset_of(provider.introduces);
+}
+
 /// Single-alt frontier with no demand.  Terminal cost-model leaves
 /// (Once, Literal, Symbol, ParamLookup).  `introduces` is empty for the
 /// expression-flavoured leaves; `Once` passes the surrounding scope's
@@ -116,15 +124,15 @@ auto OutputCombine(CostFrontier const &row_pipe, CostFrontier const &named_out, 
   return CostFrontier::cartesian_product_if(
       row_pipe,
       named_out,
-      [](Alternative const &a, Alternative const &b) {
-        DMG_ASSERT(a.required.empty(), "operator Alt must have empty required");
-        return b.required.is_subset_of(a.introduces);
+      [](Alternative const &row_alt, Alternative const &named_alt) {
+        DMG_ASSERT(row_alt.required.empty(), "operator Alt must have empty required");
+        return DemandMet(row_alt, named_alt);
       },
-      [enode_id](Alternative const &a, Alternative const &b) {
-        return Alternative{.cost = a.cost + (a.cardinality * b.cost),
-                           .cardinality = a.cardinality,
+      [enode_id](Alternative const &row_alt, Alternative const &named_alt) {
+        return Alternative{.cost = row_alt.cost + (row_alt.cardinality * named_alt.cost),
+                           .cardinality = row_alt.cardinality,
                            .required = {},
-                           .introduces = a.introduces,
+                           .introduces = row_alt.introduces,
                            .enode_id = enode_id};
       });
 }
@@ -163,7 +171,7 @@ auto BindFlatMap(CostFrontier const &input, CostFrontier const &expr, planner::c
     // Alive: sym has at least one Identifier reference somewhere in the e-graph.
     if (referenced_syms.test(sym_bit)) {
       for (Alternative const &expr_alt : expr.alts()) {
-        if (!expr_alt.required.is_subset_of(input_alt.introduces)) continue;  // demand unsatisfiable by this input
+        if (!DemandMet(input_alt, expr_alt)) continue;  // demand unsatisfiable by this input
         // Bind is one-shot, not a row-pipe: passes input's cardinality
         // through unchanged.  expr is evaluated once at bind-time.
         emit({.cost = BindAliveCost(input_alt.cost, sym_cost, expr_alt.cost, input_alt.cardinality),
@@ -197,7 +205,7 @@ auto UnwindFlatMap(CostFrontier const &input, CostFrontier const &list, planner:
   return CostFrontier::flat_map(input, [&, enode_id, sym_bit](Alternative const &input_alt, auto emit) {
     DMG_ASSERT(input_alt.required.empty(), "operator Alt must have empty required");
     for (Alternative const &list_alt : list.alts()) {
-      if (!list_alt.required.is_subset_of(input_alt.introduces)) continue;  // demand unsatisfiable by this input
+      if (!DemandMet(input_alt, list_alt)) continue;  // demand unsatisfiable by this input
       auto const cost = input_alt.cost + ((list_alt.cost + kUnwindPerRowOverhead) * input_alt.cardinality) + sym_cost;
       auto const cardinality = input_alt.cardinality * list_alt.cardinality;
       emit({.cost = cost,
@@ -209,23 +217,25 @@ auto UnwindFlatMap(CostFrontier const &input, CostFrontier const &list, planner:
   });
 }
 
-/// Subquery flat-map: scope-barrier row-pipe.  Inner alts with non-empty
-/// required are silently rejected (non-importing CALL only).  Inner
-/// introductions are STRIPPED at the boundary; only `exposed_syms`
-/// (children[2..]) cross into the outer scope, unioned with outer's own
-/// introductions.
+/// Subquery flat-map: scope-barrier row-pipe.  Non-importing CALL only - an
+/// importing inner is pruned to an empty frontier by its Output and rejected by
+/// the Subquery cost guard, so every inner alt reaching here is self-contained
+/// (`required = ∅`).  Inner introductions are STRIPPED at the boundary; only
+/// `exposed_syms` (children[2..]) cross into the outer scope, unioned with
+/// outer's own introductions.
 auto SubqueryFlatMap(CostFrontier const &outer, CostFrontier const &inner, VariableSet exposed_syms,
                      planner::core::ENodeId enode_id) -> CostFrontier {
   return CostFrontier::flat_map(
       outer, [&inner, exposed_syms = std::move(exposed_syms), enode_id](Alternative const &outer_alt, auto emit) {
+        DMG_ASSERT(outer_alt.required.empty(), "operator Alt must have empty required");
         for (Alternative const &inner_alt : inner.alts()) {
-          // Non-importing subquery: inner must be self-contained.
-          if (!inner_alt.required.empty()) continue;
+          DMG_ASSERT(inner_alt.required.empty(), "non-importing CALL: inner alt must be self-contained");
 
           // BARRIER: outer.introduces ∪ exposed_syms; inner.introduces is dropped.
+          // Operator-Alt dichotomy: the emitted Subquery Alt has empty required.
           emit({.cost = outer_alt.cost + (outer_alt.cardinality * inner_alt.cost),
                 .cardinality = outer_alt.cardinality * inner_alt.cardinality,
-                .required = outer_alt.required,
+                .required = {},
                 .introduces = outer_alt.introduces.set_union(exposed_syms),
                 .enode_id = enode_id});
         }
@@ -281,7 +291,7 @@ struct symbol_cost_traits<symbol::Once> {
   // outer_scope is empty; for an inner block of an importing CALL / Apply /
   // Cartesian (future work) outer_scope carries what the outer pipeline binds.
   static auto cost(ENodeT const &, ENodeId id, CostChildren, CostCtx const &ctx) -> CostFrontier {
-    return LeafFrontier(kOnceLeaf, id, ctx.env.outer_scope);
+    return LeafFrontier(kOnceLeaf, id, ctx.syms.outer_scope);
   }
 };
 
@@ -314,7 +324,7 @@ struct symbol_cost_traits<symbol::Identifier> {
     assert(!children.empty() && "Identifier must have its symbol child frontier");
     auto const sym_eclass = n.children()[0];
     auto const &[_, child_cost] = children[0]->resolve();
-    return IdentifierFrontier(kIdentifier + child_cost, sym_eclass, ctx.env.variable_index, id);
+    return IdentifierFrontier(kIdentifier + child_cost, sym_eclass, ctx.syms.variable_index, id);
   }
 };
 
@@ -328,7 +338,7 @@ struct symbol_cost_traits<symbol::Bind> {
     auto const sym_eclass = n.children()[1];
     auto const &[_, sym_cost] = children[1]->resolve();
     return BindFlatMap(
-        *children[0], *children[2], sym_eclass, sym_cost, ctx.env.referenced_syms, ctx.env.variable_index, id);
+        *children[0], *children[2], sym_eclass, sym_cost, ctx.syms.referenced_syms, ctx.syms.variable_index, id);
   }
 };
 
@@ -340,7 +350,7 @@ struct symbol_cost_traits<symbol::Unwind> {
   static auto cost(ENodeT const &n, ENodeId id, CostChildren children, CostCtx const &ctx) -> CostFrontier {
     auto const sym_eclass = n.children()[1];
     auto const &[_, sym_cost] = children[1]->resolve();
-    return UnwindFlatMap(*children[0], *children[2], sym_eclass, sym_cost, ctx.env.variable_index, id);
+    return UnwindFlatMap(*children[0], *children[2], sym_eclass, sym_cost, ctx.syms.variable_index, id);
   }
 };
 
@@ -348,16 +358,18 @@ template <>
 struct symbol_cost_traits<symbol::Subquery> {
   // Scope-barrier row-pipe.  Children layout is [outer, inner, exposed_sym...].
   // Inner's introduces are STRIPPED at the barrier; only exposed_syms cross
-  // into the outer scope.  Importing-CALL is unsupported - guard up front so
-  // a failing query surfaces the real cause instead of a downstream
-  // "no self-contained alternative".
+  // into the outer scope.  Importing-CALL is unsupported: an importing inner
+  // references a symbol bound only in the outer scope, which the inner Output's
+  // satisfiability filter prunes - leaving inner with no self-contained alt.
+  // Throw up front so that surfaces as the real cause rather than a downstream
+  // "root frontier has no self-contained alternative" PlannerBug.
   static auto cost(ENodeT const &n, ENodeId id, CostChildren children, CostCtx const &ctx) -> CostFrontier {
     bool const has_self_contained_inner =
         std::ranges::any_of(children[1]->alts(), [](Alternative const &a) { return a.required.empty(); });
     if (!has_self_contained_inner) {
       throw NotYetImplemented{"importing CALL subqueries"};
     }
-    auto exposed_syms = ctx.env.variable_index.to_variable_set(n.children().subspan(2));
+    auto exposed_syms = ctx.syms.variable_index.to_variable_set(n.children().subspan(2));
     return SubqueryFlatMap(*children[0], *children[1], std::move(exposed_syms), id);
   }
 };
@@ -375,7 +387,7 @@ struct symbol_cost_traits<symbol::Output> {
   // NamedOutput syms are exposed to the resolver's `in_scope` at Output's
   // position and become part of the `chosen.introduces` it commits upward.
   static auto cost(ENodeT const &n, ENodeId id, CostChildren children, CostCtx const &ctx) -> CostFrontier {
-    auto const own_syms = ExtractOutputOwnSyms(n, ctx.env.egraph, ctx.env.variable_index);
+    auto const own_syms = ExtractOutputOwnSyms(n, ctx.syms.egraph, ctx.syms.variable_index);
     auto result = Restamp(*children[0], 0.0, id);
     for (auto const *named_out : children.subspan(1)) {
       result = OutputCombine(result, *named_out, id);
@@ -461,7 +473,7 @@ auto ExtractOutputOwnSyms(planner::core::ENode<symbol> const &output_enode, EGra
   VariableSet out;
   for (auto const no_eclass : output_enode.children().subspan(1)) {
     auto const &cls = egraph.eclass(no_eclass);
-    DMG_ASSERT(!cls.nodes().empty(), "NamedOutput e-class must have at least one enode");
+    DMG_ASSERT(cls.nodes().size() == 1, "NamedOutput e-class must be a singleton");
     auto const &no_enode = egraph.get_enode(cls.nodes().front());
     DMG_ASSERT(!no_enode.children().empty(), "NamedOutput enode must have at least one child (sym leaf)");
     out.set(idx.bit_of(no_enode.children()[0]));

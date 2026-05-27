@@ -12,7 +12,6 @@
 #include "bench_rewrite.hpp"
 
 using namespace memgraph::planner::bench;
-using namespace memgraph::planner::bench::sizes;
 
 // ============================================================================
 // Join Strategies

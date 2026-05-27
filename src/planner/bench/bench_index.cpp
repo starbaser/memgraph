@@ -15,7 +15,6 @@
 #include <vector>
 
 using namespace memgraph::planner::bench;
-using namespace memgraph::planner::bench::sizes;
 
 // Index rebuild happens after every e-graph modification.
 

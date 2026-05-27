@@ -41,7 +41,7 @@ struct BuiltinEstimator final : CardinalityEstimator {
 
   explicit BuiltinEstimator(egraph const &f);
 
-  auto Estimate(planner::core::ENode<symbol> const &enode, std::span<planner::core::EClassId const> arg_eclasses) const
+  auto Estimate(planner::core::ENode<symbol> const &enode, std::span<planner::core::EClassId const> children) const
       -> double override;
 };
 

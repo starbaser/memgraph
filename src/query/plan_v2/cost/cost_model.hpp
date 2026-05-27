@@ -28,13 +28,13 @@ struct CostFrontier
   using CostResultBase::CostResultBase;
 };
 
-/// Per-extraction cost-model state passed to every `symbol_cost_traits<S>::cost`.
+/// Read-only state the cost model reads while scoring an e-node.
 struct CostCtx {
   using CostResult = CostFrontier;
 
   // NOLINTBEGIN(cppcoreguidelines-avoid-const-or-ref-data-members)
   CardinalityEstimator const &estimator;
-  ExtractionEnv const &env;
+  SymbolContext const &syms;
   // NOLINTEND(cppcoreguidelines-avoid-const-or-ref-data-members)
 
   auto operator()(planner::core::ENode<symbol> const &current, planner::core::ENodeId enode_id,

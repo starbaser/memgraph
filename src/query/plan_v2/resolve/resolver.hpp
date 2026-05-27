@@ -52,7 +52,7 @@ struct ResolverKey {
 /// child eclasses during the top-down resolver walk, unrelated to threads.)
 struct UniformResolveChildren {
   static void resolve_children(planner::core::ENode<symbol> const &enode, ResolverKey const &parent_key,
-                               VariableSet const & /*chosen_introduces*/, ExtractionEnv const & /*env*/,
+                               VariableSet const & /*chosen_introduces*/, SymbolContext const & /*syms*/,
                                planner::core::extract::ChildSink<ResolverKey> auto visit) {
     for (auto child : enode.children()) visit(ResolverKey{child, parent_key.in_scope, {}});
   }
@@ -68,10 +68,10 @@ struct symbol_resolve_traits;  // primary intentionally undefined; every symbol 
 //   in_scope       = parent.in_scope ∪ (chosen.introduces − {own_sym})
 //   must_introduce = ∅
 inline void ResolveBindUnwindAlive(planner::core::ENode<symbol> const &enode, ResolverKey const &parent_key,
-                                   VariableSet const &chosen_introduces, ExtractionEnv const &env, auto visit) {
+                                   VariableSet const &chosen_introduces, SymbolContext const &syms, auto visit) {
   auto const &children = enode.children();
   auto const sym_eclass = children[1];
-  auto pipe_must_introduce = chosen_introduces.difference_bit(env.variable_index.bit_of(sym_eclass));
+  auto pipe_must_introduce = chosen_introduces.difference_bit(syms.variable_index.bit_of(sym_eclass));
   auto expr_in_scope = parent_key.in_scope.set_union(pipe_must_introduce);
   visit(ResolverKey{children[0], parent_key.in_scope, pipe_must_introduce});
   visit(ResolverKey{sym_eclass, parent_key.in_scope, {}});
@@ -88,10 +88,10 @@ struct symbol_resolve_traits<symbol::Bind> {
   // emits both variants for a Bind enode; whichever the resolver picks
   // decides which propagation rule fires.
   static void resolve_children(planner::core::ENode<symbol> const &enode, ResolverKey const &parent_key,
-                               VariableSet const &chosen_introduces, ExtractionEnv const &env,
+                               VariableSet const &chosen_introduces, SymbolContext const &syms,
                                planner::core::extract::ChildSink<ResolverKey> auto visit) {
-    if (enode.children().size() == 3 && chosen_introduces.test(env.variable_index.bit_of(enode.children()[1]))) {
-      ResolveBindUnwindAlive(enode, parent_key, chosen_introduces, env, visit);
+    if (enode.children().size() == 3 && chosen_introduces.test(syms.variable_index.bit_of(enode.children()[1]))) {
+      ResolveBindUnwindAlive(enode, parent_key, chosen_introduces, syms, visit);
     } else {
       ResolveBindDead(enode, parent_key, visit);
     }
@@ -101,11 +101,11 @@ struct symbol_resolve_traits<symbol::Bind> {
 template <>
 struct symbol_resolve_traits<symbol::Unwind> {
   static void resolve_children(planner::core::ENode<symbol> const &enode, ResolverKey const &parent_key,
-                               VariableSet const &chosen_introduces, ExtractionEnv const &env,
+                               VariableSet const &chosen_introduces, SymbolContext const &syms,
                                planner::core::extract::ChildSink<ResolverKey> auto visit) {
-    DMG_ASSERT(enode.children().size() == 3 && chosen_introduces.test(env.variable_index.bit_of(enode.children()[1])),
+    DMG_ASSERT(enode.children().size() == 3 && chosen_introduces.test(syms.variable_index.bit_of(enode.children()[1])),
                "Unwind alt must always be alive (Unwind always binds its sym)");
-    ResolveBindUnwindAlive(enode, parent_key, chosen_introduces, env, visit);
+    ResolveBindUnwindAlive(enode, parent_key, chosen_introduces, syms, visit);
   }
 };
 
@@ -115,11 +115,11 @@ struct symbol_resolve_traits<symbol::Subquery> {
   // subquery itself exposes; inner is barrier-isolated (in_scope = ∅), with
   // only `exposed_syms` crossing outward via the cost-model's `introduces`.
   static void resolve_children(planner::core::ENode<symbol> const &enode, ResolverKey const &parent_key,
-                               VariableSet const & /*chosen_introduces*/, ExtractionEnv const &env,
+                               VariableSet const & /*chosen_introduces*/, SymbolContext const &syms,
                                planner::core::extract::ChildSink<ResolverKey> auto visit) {
     auto const &children = enode.children();
     DMG_ASSERT(children.size() >= 2, "Subquery enode must have at least outer and inner children");
-    auto const exposed = env.variable_index.to_variable_set(children.subspan(2));
+    auto const exposed = syms.variable_index.to_variable_set(children.subspan(2));
     auto outer_demand = parent_key.must_introduce.difference(exposed);
     visit(ResolverKey{children[0], parent_key.in_scope, std::move(outer_demand)});
     visit(ResolverKey{children[1], VariableSet{}, VariableSet{}});
@@ -138,11 +138,11 @@ struct symbol_resolve_traits<symbol::Output> {
   //   in_scope       = parent.in_scope ∪ (chosen.introduces − own_syms)
   //   must_introduce = ∅
   static void resolve_children(planner::core::ENode<symbol> const &enode, ResolverKey const &parent_key,
-                               VariableSet const &chosen_introduces, ExtractionEnv const &env,
+                               VariableSet const &chosen_introduces, SymbolContext const &syms,
                                planner::core::extract::ChildSink<ResolverKey> auto visit) {
     auto const &children = enode.children();
     DMG_ASSERT(!children.empty(), "Output enode must have at least a pipe child");
-    auto const own_syms = ExtractOutputOwnSyms(enode, env.egraph, env.variable_index);
+    auto const own_syms = ExtractOutputOwnSyms(enode, syms.egraph, syms.variable_index);
     auto const pipe_must_introduce = chosen_introduces.difference(own_syms);
     auto const named_out_in_scope = parent_key.in_scope.set_union(pipe_must_introduce);
     visit(ResolverKey{children[0], parent_key.in_scope, pipe_must_introduce});
@@ -175,10 +175,10 @@ EGRAPH_UNARY_OPS(MG_UNIFORM_FROM_OP)
 // NOLINTEND(cppcoreguidelines-macro-usage)
 
 void ResolveChildren(planner::core::ENode<symbol> const &enode, ResolverKey const &parent_key,
-                     VariableSet const &chosen_introduces, ExtractionEnv const &env,
+                     VariableSet const &chosen_introduces, SymbolContext const &syms,
                      planner::core::extract::ChildSink<ResolverKey> auto visit) {
   DispatchBySymbol(enode.symbol(), [&]<symbol S>() {
-    symbol_resolve_traits<S>::resolve_children(enode, parent_key, chosen_introduces, env, visit);
+    symbol_resolve_traits<S>::resolve_children(enode, parent_key, chosen_introduces, syms, visit);
   });
 }
 
@@ -186,7 +186,7 @@ void ResolveChildren(planner::core::ENode<symbol> const &enode, ResolverKey cons
 /// `required ⊆ in_scope` and `introduces ⊇ must_introduce`, classifies
 /// frontier failures into PlannerBug vs NotYetImplemented, and dispatches
 /// per-operator child threading via `ResolveChildren`.
-auto ResolvePlanNode(ExtractionEnv const &env, planner::core::extract::FrontierMap<CostFrontier> const &frontier_map,
+auto ResolvePlanNode(SymbolContext const &syms, planner::core::extract::FrontierMap<CostFrontier> const &frontier_map,
                      ResolverKey const &key, planner::core::extract::ChildSink<ResolverKey> auto record_child)
     -> planner::core::ENodeId {
   auto const fr_it = frontier_map.find(key.eclass);
@@ -205,8 +205,8 @@ auto ResolvePlanNode(ExtractionEnv const &env, planner::core::extract::FrontierM
     throw NotYetImplemented{"planner-v2 extraction of this query pattern"};
   }
   auto const &chosen = *best;
-  auto const &enode = env.egraph.get_enode(chosen.enode_id);
-  ResolveChildren(enode, key, chosen.introduces, env, record_child);
+  auto const &enode = syms.egraph.get_enode(chosen.enode_id);
+  ResolveChildren(enode, key, chosen.introduces, syms, record_child);
   return chosen.enode_id;
 }
 

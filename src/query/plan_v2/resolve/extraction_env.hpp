@@ -27,7 +27,7 @@ namespace memgraph::query::plan::v2 {
 using EGraph = planner::core::EGraph<symbol, analysis>;
 
 /// Read-only state shared across one extraction pass.
-struct ExtractionEnv {
+struct SymbolContext {
   // NOLINTBEGIN(cppcoreguidelines-avoid-const-or-ref-data-members)
   EGraph const &egraph;
   VariableIndex const &variable_index;

@@ -181,7 +181,7 @@ template <typename Symbol, typename Analysis, typename CostModel>
   auto sentinel_it = out.emplace(eclass_id, std::nullopt).first;
   MG_ASSERT(out.bucket_count() == initial_bucket_count, "sentinel emplace triggered rehash");
 
-  auto merged_frontier = std::optional<CostResult>{};
+  auto eclass_frontier = std::optional<CostResult>{};
 
   // Per-frame buffer; nested recursive frames get their own slot.
   auto [guard, children_frontiers] = ctx.frontier_buffer_pool.acquire();
@@ -210,10 +210,10 @@ template <typename Symbol, typename Analysis, typename CostModel>
 
     auto enode_frontier = cost_model(enode, enode_id, children_frontiers);
 
-    if (!merged_frontier) {
-      merged_frontier = std::move(enode_frontier);
+    if (!eclass_frontier) {
+      eclass_frontier = std::move(enode_frontier);
     } else {
-      merged_frontier->merge_in_place(std::move(enode_frontier));
+      eclass_frontier->merge_in_place(std::move(enode_frontier));
     }
   }
 
@@ -222,8 +222,8 @@ template <typename Symbol, typename Analysis, typename CostModel>
   // Re-checking here makes the iterator-stability invariant locally evident.
   MG_ASSERT(out.bucket_count() == initial_bucket_count, "rehash during child recursion invalidated sentinel_it");
 
-  if (merged_frontier) {
-    sentinel_it->second = std::move(merged_frontier);
+  if (eclass_frontier) {
+    sentinel_it->second = std::move(eclass_frontier);
     return &*sentinel_it->second;
   }
 
@@ -276,7 +276,7 @@ void DfsPostOrder(Key root, boost::unordered_flat_map<Key, std::uint32_t, KeyHas
   // nested calls may rehash and invalidate any iterator or map-slot reference
   // captured here.  Pass the local to `make_entry` (not `it->first`) and
   // re-lookup the slot for the final write after `make_entry` returns.
-  auto recurse = [&](this auto const &self, Key key) -> std::uint32_t {
+  auto visit = [&](this auto const &self, Key key) -> std::uint32_t {
     auto [it, inserted] = seen.try_emplace(key, kCycleSentinel);
     if (!inserted) {
       assert(it->second != kCycleSentinel && "cycle in DfsPostOrder");
@@ -285,12 +285,12 @@ void DfsPostOrder(Key root, boost::unordered_flat_map<Key, std::uint32_t, KeyHas
     auto entry = make_entry(key, self);
     auto const idx = static_cast<std::uint32_t>(out.size());
     out.push_back(std::move(entry));
-    auto const write_it = seen.find(key);
-    assert(write_it != seen.end() && "DfsPostOrder key vanished from seen");
-    write_it->second = idx;
+    // Re-look-up rather than reuse `it`: nested `try_emplace`s during
+    // `make_entry` may have rehashed `seen` and invalidated it.
+    seen.find(key)->second = idx;
     return idx;
   };
-  recurse(std::move(root));
+  visit(std::move(root));
 }
 
 }  // namespace memgraph::planner::core::extract

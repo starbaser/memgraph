@@ -119,7 +119,7 @@ auto ComputeFrontiersAndCheckRoot(EGraph const &core, CostCtx const &cost_ctx, p
 /// Post-order resolver: writes ResolvedEntries + CSR child indices into
 /// `ctx.build`. Per-node policy (alt selection + child threading + error
 /// classification) lives in `ResolvePlanNode`.
-void ResolveSelection(EGraph const &core, ExtractionEnv const &env, planner::core::EClassId true_root,
+void ResolveSelection(EGraph const &core, SymbolContext const &syms, planner::core::EClassId true_root,
                       QueryPlannerContext::Impl &ctx) {
   namespace extract = planner::core::extract;
   extract::Resolve<symbol, analysis, CostFrontier>(
@@ -128,7 +128,7 @@ void ResolveSelection(EGraph const &core, ExtractionEnv const &env, planner::cor
       [&](ResolverKey const &key,
           extract::FrontierMap<CostFrontier> const &frontier_map,
           auto const & /*egraph_ref*/,
-          auto record_child) { return ResolvePlanNode(env, frontier_map, key, record_child); },
+          auto record_child) { return ResolvePlanNode(syms, frontier_map, key, record_child); },
       ctx);
 }
 
@@ -149,17 +149,18 @@ auto BuildOperatorTree(auto const &impl, QueryPlannerContext::Impl &ctx) -> Buil
       .symbol_store = impl.graph.template storage<symbol::Symbol>().store,
       .function_info = impl.graph.template storage<symbol::Function>().info,
   };
-  auto built = std::vector<BuildResult>(ctx.build.build_order.size());
+  auto const resolved_entries = ctx.build.resolved_entries();
+  auto built = std::vector<BuildResult>{};
+  built.reserve(resolved_entries.size());
 
   auto children_refs = std::vector<ChildRef>{};
-  for (std::uint32_t i = 0; i < ctx.build.build_order.size(); ++i) {
-    auto const &entry = ctx.build.build_order[i];
+  for (auto const &entry : resolved_entries) {
     auto const &enode = impl.graph.core().get_enode(entry.enode_id);
 
     auto const child_slots = ctx.build.children_of(entry);
     auto const built_children = child_slots | std::views::transform([&](auto slot) { return std::cref(built[slot]); });
     children_refs.assign_range(built_children);
-    built[i] = build_state.Build(enode, children_refs);
+    built.push_back(build_state.Build(enode, children_refs));
   }
 
   DMG_ASSERT(!built.empty(), "build order must contain at least the root entry");
@@ -185,16 +186,16 @@ auto ConvertToLogicalOperator(egraph const &e, eclass root, QueryPlannerContext 
 
   // Top-level query: outer_scope is empty. Importing CALL / Apply / Cartesian
   // inner blocks (future work) will seed it with what the outer pipeline binds.
-  ExtractionEnv const env{.egraph = impl.graph.core(),
-                          .variable_index = pre.variable_index,
-                          .outer_scope = VariableSet{},
-                          .referenced_syms = std::move(pre.referenced_syms)};
+  SymbolContext const syms{.egraph = impl.graph.core(),
+                           .variable_index = pre.variable_index,
+                           .outer_scope = VariableSet{},
+                           .referenced_syms = std::move(pre.referenced_syms)};
 
   auto const active_estimator = BuiltinEstimator{e};
   auto const &root_frontier = ComputeFrontiersAndCheckRoot(
-      impl.graph.core(), CostCtx{.estimator = active_estimator, .env = env}, true_root, ctx);
+      impl.graph.core(), CostCtx{.estimator = active_estimator, .syms = syms}, true_root, ctx);
 
-  ResolveSelection(impl.graph.core(), env, true_root, ctx);
+  ResolveSelection(impl.graph.core(), syms, true_root, ctx);
 
   auto build_out = BuildOperatorTree(impl, ctx);
 

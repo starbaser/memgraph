@@ -88,10 +88,10 @@ auto EstimateFunction(EGraph const &eg, egraph const &facade, planner::core::ENo
 BuiltinEstimator::BuiltinEstimator(egraph const &f) : CardinalityEstimator(impl_of(f).graph.core()), facade(f) {}
 
 auto BuiltinEstimator::Estimate(planner::core::ENode<symbol> const &enode,
-                                std::span<planner::core::EClassId const> arg_eclasses) const -> double {
+                                std::span<planner::core::EClassId const> children) const -> double {
   switch (enode.symbol()) {
     case symbol::Function:
-      return EstimateFunction(eg_, facade, enode, arg_eclasses);
+      return EstimateFunction(eg_, facade, enode, children);
     default:
       return kDefaultRowEstimate;
   }

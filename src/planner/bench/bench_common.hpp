@@ -32,7 +32,6 @@ using core::ProcessingContext;
 using pattern::EMatchContext;
 using pattern::PatternVar;
 
-namespace sizes {
 constexpr int64_t kSmall = 10;
 constexpr int64_t kMedium = 100;
 constexpr int64_t kLarge = 1000;
@@ -42,22 +41,11 @@ constexpr int64_t kMassive = 50000;
 
 constexpr int64_t kFreshCtx = 0;
 constexpr int64_t kReusedCtx = 1;
-}  // namespace sizes
-
-// Pull size constants into bench:: so registration sites stay terse.
-using sizes::kFreshCtx;
-using sizes::kHuge;
-using sizes::kLarge;
-using sizes::kMassive;
-using sizes::kMedium;
-using sizes::kReusedCtx;
-using sizes::kSmall;
-using sizes::kXLarge;
 
 template <typename ApplyFn>
 void BenchmarkWithMatchContext(benchmark::State &state, int64_t context_mode, EMatchContext &reusable_context,
                                ApplyFn &&apply_fn) {
-  if (context_mode == sizes::kReusedCtx) {
+  if (context_mode == kReusedCtx) {
     for (auto _ : state) {
       reusable_context.clear();
       apply_fn(reusable_context);

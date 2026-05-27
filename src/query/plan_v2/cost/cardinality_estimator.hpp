@@ -52,7 +52,7 @@ struct CardinalityEstimator {
   virtual ~CardinalityEstimator() = default;
 
   virtual auto Estimate(planner::core::ENode<symbol> const &enode,
-                        std::span<planner::core::EClassId const> arg_eclasses) const -> double = 0;
+                        std::span<planner::core::EClassId const> children) const -> double = 0;
 
  protected:
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
