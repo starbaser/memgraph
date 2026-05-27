@@ -1306,7 +1306,6 @@ std::unique_ptr<Module> LoadModuleFromFile(const std::filesystem::path &path) {
   if (!memgraph::license::global_license_checker.IsEnterpriseValidFast() &&
       std::ranges::contains(kEnterpriseModuleList, name)) {
     spdlog::warn(fmt::format("Failed to load query module {} because it requires a valid enterprise license.", path));
-    return nullptr;
   }
 #endif
   std::unique_ptr<Module> module;
