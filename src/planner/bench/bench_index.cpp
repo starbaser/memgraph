@@ -21,6 +21,7 @@ using namespace memgraph::planner::bench::sizes;
 
 class IndexBuildFixture : public MatcherFixtureBase {
  protected:
+  using benchmark::Fixture::SetUp;
   int64_t graph_size_ = 0;
 
   void SetUp(const benchmark::State &state) override {
@@ -50,6 +51,7 @@ BENCHMARK_REGISTER_F(IndexBuildFixture, FullRebuild)
 
 class IncrementalUpdateFixture : public MatcherFixtureBase {
  protected:
+  using benchmark::Fixture::SetUp;
   int64_t initial_size_ = 0;
   int64_t increment_size_ = 0;
 

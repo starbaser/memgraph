@@ -298,7 +298,7 @@ struct ParetoFrontier {
     auto out = std::vector<Alt>{};
     out.reserve(input_alts.size());
     for (Alt const &alt : input_alts) {
-      fn(alt, [&](Alt &&v) { out.push_back(std::move(v)); });
+      fn(alt, [&out](Alt &&v) { out.push_back(std::move(v)); });
     }
     return ParetoFrontier{std::move(out)};
   }
@@ -401,6 +401,17 @@ struct ParetoFrontier {
   /// other; the sweep starts at `pruned_prefix`.  Used by `merge_in_place`,
   /// where `*this` is known pruned before the suffix is appended.  Other
   /// public ops pass 0 (the default).
+  // Compact survivors `alts_[first, last)` down to `kept`, returning the new
+  // kept count.  Used to retain the untested tail of survivors when a candidate
+  // has been dominated and the scan stops early.
+  size_t retain_survivors(size_t kept, size_t first, size_t last) {
+    for (size_t k = first; k < last; ++k) {
+      if (kept != k) alts_[kept] = std::move(alts_[k]);
+      ++kept;
+    }
+    return kept;
+  }
+
   void prune(size_t pruned_prefix = 0) {
     auto const n = alts_.size();
     if (n < 2 || n <= pruned_prefix) return;
@@ -415,10 +426,7 @@ struct ParetoFrontier {
           // Survivor dominates or ties candidate: drop candidate, retain
           // remaining survivors (transitivity guarantees candidate can no
           // longer dominate any of them).
-          for (size_t k = j; k < write; ++k) {
-            if (kept != k) alts_[kept] = std::move(alts_[k]);
-            ++kept;
-          }
+          kept = retain_survivors(kept, j, write);
           dominated = true;
           break;
         }

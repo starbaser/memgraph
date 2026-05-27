@@ -22,7 +22,7 @@
 // PR_SET_DUMPABLE=0 makes the kernel skip core-dump generation for this
 // process and its forked children, regardless of /proc/sys/kernel/core_pattern.
 // RLIMIT_CORE=0 is also set as a belt-and-braces fallback.
-static auto disable_core_dumps = [] {
+static auto const disable_core_dumps = [] {
   auto rl = rlimit{.rlim_cur = 0, .rlim_max = 0};
   setrlimit(RLIMIT_CORE, &rl);
   prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);

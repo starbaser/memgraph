@@ -897,6 +897,19 @@ void ValidateBindingOrder(Reporter &r, std::span<Instruction const> code, Compil
                 bc);
 }
 
+// Resolve a Yield Jump target to its effective NextX address.
+// The target may be a MarkSeen trampoline: MarkSeen → NextX or MarkSeen → Jump → NextX.
+inline auto ResolveYieldJumpTarget(std::span<Instruction const> code, uint16_t target) -> uint16_t {
+  if (target < code.size() && code[target].op == VMOp::MarkSeen) {
+    auto next = target + 1;
+    if (next < code.size()) {
+      if (is_next_op(code[next].op)) return next;
+      if (code[next].op == VMOp::Jump) return code[next].target;
+    }
+  }
+  return target;
+}
+
 /// Yield backward Jump must not skip over BindSlot loops.
 /// The Jump may target a NextX directly or a MarkSeen trampoline that precedes
 /// a NextX. We resolve to the effective NextX, then check that every BindSlot
@@ -904,19 +917,6 @@ void ValidateBindingOrder(Reporter &r, std::span<Instruction const> code, Compil
 /// A violation means an inner loop introduces new bindings that the Jump skips.
 template <typename Reporter>
 void ValidateYieldJumpCoversBindSlots(Reporter &r, std::span<Instruction const> code, auto const &bc) {
-  // Resolve a Yield Jump target to its effective NextX address.
-  // The target may be a MarkSeen trampoline: MarkSeen → NextX or MarkSeen → Jump → NextX.
-  auto resolve_target = [&](uint16_t target) -> uint16_t {
-    if (target < code.size() && code[target].op == VMOp::MarkSeen) {
-      auto next = target + 1;
-      if (next < code.size()) {
-        if (is_next_op(code[next].op)) return next;
-        if (code[next].op == VMOp::Jump) return code[next].target;
-      }
-    }
-    return target;
-  };
-
   for (std::size_t i = 0; i < code.size(); ++i) {
     if (code[i].op != VMOp::Yield) continue;
     if (i + 1 >= code.size() || code[i + 1].op != VMOp::Jump) continue;
@@ -925,7 +925,7 @@ void ValidateYieldJumpCoversBindSlots(Reporter &r, std::span<Instruction const> 
     // Only check backward jumps (the normal Yield loop-back)
     if (jump_target > i) continue;
 
-    auto effective_target = resolve_target(jump_target);
+    auto effective_target = ResolveYieldJumpTarget(code, jump_target);
 
     for (auto j = effective_target + 1; j < i; ++j) {
       if (code[j].op == VMOp::BindSlot) {

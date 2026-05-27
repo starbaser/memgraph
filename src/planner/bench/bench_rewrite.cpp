@@ -167,6 +167,7 @@ BENCHMARK_REGISTER_F(SingleIterationFixture, Once)
 
 class RealisticFixture : public RewriterFixtureBase {
  protected:
+  using benchmark::Fixture::SetUp;
   TestRuleSet rules_;
   int64_t graph_size_ = 0;
 
@@ -210,6 +211,7 @@ BENCHMARK_REGISTER_F(RealisticFixture, Saturate)
 
 class RewriteFixture : public MatcherFixtureBase {
  protected:
+  using benchmark::Fixture::SetUp;
   TestVMExecutor vm_executor_{egraph_};
   TestRewriteContext ctx_{egraph_};
   TestRewriteRule rule_ = RuleDoubleNeg();

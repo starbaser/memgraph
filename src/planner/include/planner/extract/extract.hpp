@@ -131,7 +131,8 @@ template <typename F, typename Symbol, typename Analysis, typename CostResult, t
 concept ResolveNodeFnType = requires(F &&f, Key const &key, FrontierMap<CostResult> const &frontier_map,
                                      EGraph<Symbol, Analysis> const &egraph) {
   {
-    std::forward<F>(f)(key, frontier_map, egraph, [](Key const &) {})
+    std::forward<F>(f)(
+        key, frontier_map, egraph, [](Key const &) { /* no-op sink: only the call's return type is probed */ })
   } -> std::convertible_to<ENodeId>;
 };
 
