@@ -15,10 +15,18 @@ VERSION="3.5.4"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --conan-remote)
+            if [[ $# -lt 2 || "$2" == --* ]]; then
+                echo "Error: --conan-remote requires a value"
+                exit 1
+            fi
             CONAN_REMOTE=$2
             shift 2
         ;;
         --version)
+            if [[ $# -lt 2 || "$2" == --* ]]; then
+                echo "Error: --version requires a value"
+                exit 1
+            fi
             VERSION=$2
             shift 2
         ;;
@@ -37,7 +45,13 @@ if [ "$exists" = "false" ]; then
     docker exec -u root "$CONTAINER_NAME" bash -c "chown -R mg:mg /home/mg/memgraph"
 fi
 
-docker exec -u mg "$CONTAINER_NAME" bash -c "cd /home/mg/memgraph && ./tools/ci/openssl/build.sh --version $VERSION --conan-remote $CONAN_REMOTE"
+build_args=(--version "$VERSION")
+if [[ -n "$CONAN_REMOTE" ]]; then
+    build_args+=(--conan-remote "$CONAN_REMOTE")
+fi
+
+printf -v build_command " %q" "${build_args[@]}"
+docker exec -u mg "$CONTAINER_NAME" bash -c "cd /home/mg/memgraph && ./tools/ci/openssl/build.sh${build_command}"
 docker exec -u mg "$CONTAINER_NAME" bash -c "cd /home/mg/memgraph && ./tools/ci/openssl/build-openssl-deb.sh $VERSION"
 docker exec -u mg "$CONTAINER_NAME" bash -c "cd /home/mg/memgraph && ./tools/ci/openssl/build-libssl3-deb.sh $VERSION"
 

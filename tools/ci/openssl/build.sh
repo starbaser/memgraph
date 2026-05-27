@@ -6,10 +6,18 @@ CONAN_REMOTE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --version)
+            if [[ $# -lt 2 || "$2" == --* ]]; then
+                echo "Error: --version requires a value"
+                exit 1
+            fi
             VERSION=$2
             shift 2
         ;;
         --conan-remote)
+            if [[ $# -lt 2 || "$2" == --* ]]; then
+                echo "Error: --conan-remote requires a value"
+                exit 1
+            fi
             CONAN_REMOTE=$2
             shift 2
         ;;
