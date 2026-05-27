@@ -1,0 +1,165 @@
+name: Build Memgraph image
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  docker-image:
+    runs-on: memgraph-docker
+    timeout-minutes: 480
+    env:
+      TOOLCHAIN: v7
+      OS: ubuntu-24.04
+      ARCH: amd
+      BUILD_TYPE: Release
+      REGISTRY: registry.eigenmage.com
+      IMAGE_NAME: starbaser/memgraph
+      PACKAGE_ARTIFACT_DIR: build/output/package
+      DOCKER_ARTIFACT_DIR: build/output/docker
+      REF_NAME: ${{ github.ref_name }}
+      REF_TYPE: ${{ github.ref_type }}
+      REF: ${{ github.ref }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Log in to registry
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_TOKEN" | docker login "$REGISTRY" --username "$REGISTRY_USERNAME" --password-stdin
+
+      - name: Start mgbuild container
+        run: |
+          set -euo pipefail
+          ./release/package/mgbuild.sh \
+            --toolchain "$TOOLCHAIN" \
+            --os "$OS" \
+            --arch "$ARCH" \
+            run --custom-mirror true
+
+      - name: Build Memgraph binaries
+        run: |
+          set -euo pipefail
+          ./release/package/mgbuild.sh \
+            --toolchain "$TOOLCHAIN" \
+            --os "$OS" \
+            --arch "$ARCH" \
+            --build-type "$BUILD_TYPE" \
+            build-memgraph \
+            --for-docker \
+            --disable-testing
+
+      - name: Create package
+        run: |
+          set -euo pipefail
+          ./release/package/mgbuild.sh \
+            --toolchain "$TOOLCHAIN" \
+            --os "$OS" \
+            --arch "$ARCH" \
+            --build-type "$BUILD_TYPE" \
+            package-memgraph
+
+      - name: Copy package
+        run: |
+          set -euo pipefail
+          ./release/package/mgbuild.sh \
+            --toolchain "$TOOLCHAIN" \
+            --os "$OS" \
+            --arch "$ARCH" \
+            copy \
+            --package \
+            --dest-dir "$PACKAGE_ARTIFACT_DIR"
+
+      - name: Build Docker image inputs
+        run: |
+          set -euo pipefail
+          ./release/package/mgbuild.sh \
+            --toolchain "$TOOLCHAIN" \
+            --os "$OS" \
+            --arch "$ARCH" \
+            build-ssl \
+            --version "3.5.4"
+          ./release/package/mgbuild.sh \
+            --toolchain "$TOOLCHAIN" \
+            --os "$OS" \
+            --arch "$ARCH" \
+            build-gssapi \
+            --dest-dir release/docker/wheels
+
+      - name: Create Docker image
+        run: |
+          set -euo pipefail
+          ./release/package/mgbuild.sh \
+            --toolchain "$TOOLCHAIN" \
+            --os "$OS" \
+            --arch "$ARCH" \
+            --build-type "$BUILD_TYPE" \
+            package-docker \
+            --src-dir "$PACKAGE_ARTIFACT_DIR" \
+            --dest-dir "$DOCKER_ARTIFACT_DIR" \
+            --generate-sbom false \
+            --malloc false \
+            --custom-mirror true \
+            --keep-image-loaded true
+
+          image_archive="$(ls -1t "$DOCKER_ARTIFACT_DIR"/memgraph*-docker.tar.gz 2>/dev/null | head -n 1)"
+          if [[ -z "$image_archive" ]]; then
+            echo "Could not find docker image archive in $DOCKER_ARTIFACT_DIR" >&2
+            exit 1
+          fi
+
+          image_tag="$(basename "$image_archive")"
+          image_tag="${image_tag#memgraph-}"
+          image_tag="${image_tag%-docker.tar.gz}"
+          echo "IMAGE_TAG=$image_tag" >> "$GITHUB_ENV"
+
+      - name: Smoke test Docker image
+        run: |
+          set -euo pipefail
+          ./tools/ci/smoke_test_docker_image.sh "memgraph/memgraph:${IMAGE_TAG}"
+
+      - name: Publish image
+        run: |
+          set -euo pipefail
+
+          source_image="memgraph/memgraph:${IMAGE_TAG}"
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          safe_ref="$(printf '%s' "$REF_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's#[^a-z0-9_.-]+#-#g; s#^-+##; s#-+$##')"
+          target_prefix="${REGISTRY}/${IMAGE_NAME}"
+          tags=("${target_prefix}:sha-${short_sha}")
+
+          if [[ -n "$safe_ref" ]]; then
+            tags+=("${target_prefix}:${safe_ref}")
+          fi
+
+          if [[ "$REF" == "refs/heads/master" ]]; then
+            tags+=("${target_prefix}:latest")
+          fi
+
+          if [[ "$REF_TYPE" == "tag" && "$REF_NAME" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            version="${REF_NAME#v}"
+            tags+=("${target_prefix}:${version}")
+          fi
+
+          for tag in "${tags[@]}"; do
+            docker tag "$source_image" "$tag"
+            docker push "$tag"
+          done
+
+      - name: Stop mgbuild container
+        if: always()
+        run: |
+          set -euo pipefail
+          ./release/package/mgbuild.sh \
+            --toolchain "$TOOLCHAIN" \
+            --os "$OS" \
+            --arch "$ARCH" \
+            stop --remove
