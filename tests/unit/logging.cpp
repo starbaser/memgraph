@@ -10,17 +10,39 @@
 // licenses/APL.txt.
 
 #include "flags/logging.hpp"
+#include "utils/session_context.hpp"
 
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
+#include <spdlog/sinks/base_sink.h>
 
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 DECLARE_string(log_file);
 DECLARE_uint64(log_retention_days);
+
+// A type whose fmt formatter bumps a counter every time it is actually
+// formatted. Lets the EmitSessionTraceEvent tests prove the format work is
+// skipped when the trace gate is closed (the lazy-format contract).
+struct CountingFormattable {
+  static inline int format_count = 0;
+};
+
+template <>
+struct fmt::formatter<CountingFormattable> : fmt::formatter<std::string_view> {
+  template <typename FormatContext>
+  auto format(const CountingFormattable & /*unused*/, FormatContext &ctx) const {
+    ++CountingFormattable::format_count;
+    return fmt::formatter<std::string_view>::format("counted", ctx);
+  }
+};
 
 namespace {
 
@@ -136,6 +158,189 @@ TEST_F(CleanLogsDirTest, NonExistentDirectory) {
   FLAGS_log_file = "/tmp/mg_nonexistent_dir_test/memgraph.log";
   FLAGS_log_retention_days = 2;
   EXPECT_NO_THROW(memgraph::flags::CleanLogsDir());
+}
+
+using memgraph::logging::EmitSessionTraceEvent;
+using memgraph::logging::ScopedSessionLog;
+using memgraph::logging::SessionLogContext;
+
+// Renders the context's tag prefix to a string via AppendPrefixTo (the prefix
+// is composed on demand, not cached).
+std::string Prefix(const SessionLogContext &ctx) {
+  fmt::memory_buffer buf;
+  ctx.AppendPrefixTo(buf);
+  return std::string(buf.data(), buf.size());
+}
+
+TEST(SessionLogContext, PrefixComposition) {
+  SessionLogContext ctx;
+  EXPECT_TRUE(Prefix(ctx).empty());
+
+  ctx.SetSessionUuid("abc");
+  EXPECT_EQ(Prefix(ctx), "[session=abc]");
+
+  ctx.SetUser("alice");
+  EXPECT_EQ(Prefix(ctx), "[session=abc] [user=alice]");
+
+  ctx.SetTxId("42");
+  EXPECT_EQ(Prefix(ctx), "[session=abc] [user=alice] [tx=42]");
+
+  // Clearing a middle field must not leave a dangling separator or empty token.
+  ctx.ClearUser();
+  EXPECT_EQ(Prefix(ctx), "[session=abc] [tx=42]");
+
+  ctx.ClearTxId();
+  EXPECT_EQ(Prefix(ctx), "[session=abc]");
+}
+
+TEST(SessionLogContext, TxOnlyHasNoUserToken) {
+  SessionLogContext ctx;
+  ctx.SetSessionUuid("s");
+  ctx.SetTxId("9");
+  EXPECT_EQ(Prefix(ctx), "[session=s] [tx=9]");
+}
+
+TEST(ScopedSessionLog, NestingPushesAndRestores) {
+  EXPECT_EQ(ScopedSessionLog::Current(), nullptr);
+  SessionLogContext outer;
+  SessionLogContext inner;
+  {
+    ScopedSessionLog g_outer(&outer);
+    EXPECT_EQ(ScopedSessionLog::Current(), &outer);
+    {
+      ScopedSessionLog g_inner(&inner);
+      EXPECT_EQ(ScopedSessionLog::Current(), &inner);
+    }
+    EXPECT_EQ(ScopedSessionLog::Current(), &outer);
+  }
+  EXPECT_EQ(ScopedSessionLog::Current(), nullptr);
+}
+
+TEST(ScopedSessionLog, RestoresOnExceptionUnwind) {
+  SessionLogContext outer;
+  SessionLogContext inner;
+  EXPECT_EQ(ScopedSessionLog::Current(), nullptr);
+  {
+    ScopedSessionLog g_outer(&outer);
+    try {
+      ScopedSessionLog g_inner(&inner);
+      ASSERT_EQ(ScopedSessionLog::Current(), &inner);
+      throw std::runtime_error("boom");
+    } catch (const std::runtime_error &) {
+      // g_inner's destructor must run during stack unwind. If it does not
+      // restore the previous context, a dangling thread_local pointer to the
+      // destroyed `inner` would leak into the next message handled on this
+      // thread.
+    }
+    EXPECT_EQ(ScopedSessionLog::Current(), &outer);
+  }
+  EXPECT_EQ(ScopedSessionLog::Current(), nullptr);
+}
+
+// Captures the raw (pre-pattern) payload of every emitted log message.
+class CapturingSink : public spdlog::sinks::base_sink<std::mutex> {
+ public:
+  std::vector<std::string> messages;
+
+ protected:
+  void sink_it_(const spdlog::details::log_msg &msg) override {
+    messages.emplace_back(msg.payload.data(), msg.payload.size());
+  }
+
+  void flush_() override {}
+};
+
+class SessionTraceEmitTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    previous_logger_ = spdlog::default_logger();
+    sink_ = std::make_shared<CapturingSink>();
+    auto logger = std::make_shared<spdlog::logger>("session_trace_test", sink_);
+    logger->set_level(spdlog::level::trace);
+    spdlog::set_default_logger(logger);
+    CountingFormattable::format_count = 0;
+  }
+
+  void TearDown() override { spdlog::set_default_logger(previous_logger_); }
+
+  std::shared_ptr<CapturingSink> sink_;
+  std::shared_ptr<spdlog::logger> previous_logger_;
+};
+
+TEST_F(SessionTraceEmitTest, NoActiveContextEmitsNothing) {
+  ASSERT_EQ(ScopedSessionLog::Current(), nullptr);
+  EmitSessionTraceEvent("hello {}", 1);
+  EXPECT_TRUE(sink_->messages.empty());
+}
+
+TEST_F(SessionTraceEmitTest, TraceDisabledEmitsNothing) {
+  SessionLogContext ctx;
+  ctx.SetSessionUuid("s1");
+  ScopedSessionLog guard(&ctx);  // trace_enabled defaults to false
+  EmitSessionTraceEvent("hello {}", 1);
+  EXPECT_TRUE(sink_->messages.empty());
+}
+
+TEST_F(SessionTraceEmitTest, TraceEnabledEmitsTaggedMessage) {
+  SessionLogContext ctx;
+  ctx.SetSessionUuid("s1");
+  ctx.SetTxId("7");
+  ctx.SetTraceEnabled(true);
+  ScopedSessionLog guard(&ctx);
+
+  EmitSessionTraceEvent("hello {}", 42);
+
+  ASSERT_EQ(sink_->messages.size(), 1u);
+  EXPECT_EQ(sink_->messages[0], "[session=s1] [tx=7] hello 42");
+}
+
+TEST_F(SessionTraceEmitTest, EmptyPrefixEmitsBareMessage) {
+  SessionLogContext ctx;  // no uuid/user/tx => empty prefix
+  ctx.SetTraceEnabled(true);
+  ScopedSessionLog guard(&ctx);
+
+  EmitSessionTraceEvent("plain {}", 5);
+
+  ASSERT_EQ(sink_->messages.size(), 1u);
+  EXPECT_EQ(sink_->messages[0], "plain 5");
+}
+
+// The regression guard for the lazy-format contract: when the gate is closed,
+// arguments must not be formatted at all (no fmt::format cost / allocation).
+TEST_F(SessionTraceEmitTest, DisabledDoesNotFormatArguments) {
+  SessionLogContext ctx;
+  ctx.SetSessionUuid("s1");
+  ScopedSessionLog guard(&ctx);  // disabled
+
+  EmitSessionTraceEvent("value {}", CountingFormattable{});
+
+  EXPECT_EQ(CountingFormattable::format_count, 0);
+  EXPECT_TRUE(sink_->messages.empty());
+}
+
+TEST_F(SessionTraceEmitTest, EnabledFormatsArgumentsExactlyOnce) {
+  SessionLogContext ctx;
+  ctx.SetTraceEnabled(true);
+  ScopedSessionLog guard(&ctx);
+
+  EmitSessionTraceEvent("value {}", CountingFormattable{});
+
+  EXPECT_EQ(CountingFormattable::format_count, 1);
+}
+
+// Trace events emit at INFO, so the process log level still filters them: with
+// trace_enabled=true but the logger level above INFO, nothing reaches the sink.
+// (This is the footgun the SET SESSION TRACE ON warning addresses.)
+TEST_F(SessionTraceEmitTest, LevelAboveInfoSuppressesEmission) {
+  spdlog::default_logger()->set_level(spdlog::level::warn);
+  SessionLogContext ctx;
+  ctx.SetSessionUuid("s1");
+  ctx.SetTraceEnabled(true);
+  ScopedSessionLog guard(&ctx);
+
+  EmitSessionTraceEvent("hello {}", 1);
+
+  EXPECT_TRUE(sink_->messages.empty());
 }
 
 }  // namespace

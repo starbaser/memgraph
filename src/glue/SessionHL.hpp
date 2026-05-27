@@ -117,6 +117,11 @@ class SessionHL final : public memgraph::communication::bolt::Session<memgraph::
 
   inline bool Execute() { return Execute_(*this); }
 
+  // Required by communication::bolt::Session::Execute_ to install the
+  // per-message log context guard. The session's trace state lives on its
+  // interpreter.
+  memgraph::logging::SessionLogContext *GetLogContext() noexcept { return interpreter_.GetLogContext(); }
+
   metrics::DatabaseMetricHandles *GetMetricHandles() {
     auto &db_acc = interpreter_.current_db_.db_acc_;
     return db_acc ? (*db_acc)->metric_handles() : nullptr;

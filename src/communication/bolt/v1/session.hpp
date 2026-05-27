@@ -26,6 +26,7 @@
 #include "communication/bolt/v1/states/init.hpp"
 #include "communication/metrics.hpp"
 #include "utils/exceptions.hpp"
+#include "utils/session_context.hpp"
 #include "utils/timestamp.hpp"
 #include "utils/uuid.hpp"
 
@@ -80,6 +81,13 @@ class Session {
    */
   template <typename TImpl>
   bool Execute_(TImpl &impl) {
+    // Install the per-message log context so structured query-trace emits made
+    // from this thread during this message's handler see the session's tag
+    // prefix and trace toggle. The RAII dtor restores on return, including
+    // unwinding paths. Every TImpl must expose GetLogContext(); it may return
+    // nullptr (ScopedSessionLog treats that as a no-op), but the method is
+    // mandatory so a new session type cannot silently skip the wiring.
+    memgraph::logging::ScopedSessionLog log_guard(impl.GetLogContext());
     if (state_ == State::Handshake) [[unlikely]] {
       // Resize the input buffer to ensure that a whole chunk can fit into it.
       // This can be done only once because the buffer holds its size.

@@ -13,6 +13,8 @@
 #include <fmt/core.h>
 #include "ctre.hpp"
 #include "memory/db_arena_fwd.hpp"
+#include "utils/logging.hpp"
+#include "utils/session_context.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -117,7 +119,6 @@
 #include "utils/exceptions.hpp"
 #include "utils/functional.hpp"
 #include "utils/likely.hpp"
-#include "utils/logging.hpp"
 #include "utils/memory.hpp"
 #include "utils/memory_tracker.hpp"
 #include "utils/on_scope_exit.hpp"
@@ -3030,8 +3031,7 @@ struct PullPlan {
   explicit PullPlan(std::shared_ptr<PlanWrapper> plan, const Parameters &parameters, bool is_profile_query,
                     DbAccessor *dba, InterpreterContext *interpreter_context, utils::MemoryResource *execution_memory,
                     std::shared_ptr<QueryUserOrRole> user_or_role, StoppingContext stopping_context,
-                    storage::DatabaseProtectorPtr protector, std::optional<QueryLogger> &query_logger,
-                    metrics::DatabaseMetricHandles &metric_handles,
+                    storage::DatabaseProtectorPtr protector, metrics::DatabaseMetricHandles &metric_handles,
                     TriggerContextCollector *trigger_context_collector = nullptr,
                     std::optional<size_t> memory_limit = {}, FrameChangeCollector *frame_change_collector_ = nullptr,
                     std::optional<int64_t> hops_limit = {}, utils::PriorityThreadPool *worker_pool = nullptr,
@@ -3053,8 +3053,6 @@ struct PullPlan {
   Frame frame_;
   ExecutionContext ctx_;
   std::optional<size_t> memory_limit_;
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
-  std::optional<QueryLogger> &query_logger_;
 #ifdef MG_ENTERPRISE
   std::shared_ptr<utils::UserResources> user_resource_{};
 #endif
@@ -3076,11 +3074,10 @@ struct PullPlan {
 PullPlan::PullPlan(const std::shared_ptr<PlanWrapper> plan, const Parameters &parameters, const bool is_profile_query,
                    DbAccessor *dba, InterpreterContext *interpreter_context, utils::MemoryResource *execution_memory,
                    std::shared_ptr<QueryUserOrRole> user_or_role, StoppingContext stopping_context,
-                   storage::DatabaseProtectorPtr protector, std::optional<QueryLogger> &query_logger,
-                   metrics::DatabaseMetricHandles &metric_handles, TriggerContextCollector *trigger_context_collector,
-                   const std::optional<size_t> memory_limit, FrameChangeCollector *frame_change_collector,
-                   const std::optional<int64_t> hops_limit, utils::PriorityThreadPool *worker_pool,
-                   memory::ArenaPool *db_arena_pool
+                   storage::DatabaseProtectorPtr protector, metrics::DatabaseMetricHandles &metric_handles,
+                   TriggerContextCollector *trigger_context_collector, const std::optional<size_t> memory_limit,
+                   FrameChangeCollector *frame_change_collector, const std::optional<int64_t> hops_limit,
+                   utils::PriorityThreadPool *worker_pool, memory::ArenaPool *db_arena_pool
 #ifdef MG_ENTERPRISE
                    ,
                    std::optional<size_t> parallel_execution, std::shared_ptr<utils::UserResources> user_resource
@@ -3089,8 +3086,7 @@ PullPlan::PullPlan(const std::shared_ptr<PlanWrapper> plan, const Parameters &pa
     : plan_(plan),
       cursor_(plan->plan().MakeCursor(execution_memory, metric_handles)),
       frame_(plan->symbol_table().max_position(), execution_memory),
-      memory_limit_(memory_limit),
-      query_logger_(query_logger)
+      memory_limit_(memory_limit)
 #ifdef MG_ENTERPRISE
       ,
       user_resource_{std::move(user_resource)}
@@ -3220,9 +3216,7 @@ std::optional<plan::ProfilingStatsWithTotalTime> PullPlan::Pull(AnyStream *strea
   summary->insert_or_assign("plan_execution_time", execution_time_.count());
   summary->insert_or_assign("number_of_hops", ctx_.number_of_hops);
 
-  if (query_logger_) {
-    query_logger_->trace(fmt::format("Query execution time: {}", execution_time_.count()));
-  }
+  memgraph::logging::EmitSessionTraceEvent("Query execution time: {}", execution_time_.count());
 
   metric_handles_->query_execution_latency_seconds.Observe(execution_time_.count());
 
@@ -3235,9 +3229,7 @@ std::optional<plan::ProfilingStatsWithTotalTime> PullPlan::Pull(AnyStream *strea
     for (size_t i = 0; i < ctx_.execution_stats.counters.size(); ++i) {
       auto key = ExecutionStatsKeyToString(ExecutionStats::Key(i));
       stats.emplace(key, ctx_.execution_stats.counters[i]);
-      if (query_logger_) {
-        query_logger_->trace(fmt::format("{}: {}", key, ctx_.execution_stats.counters[i]));
-      }
+      memgraph::logging::EmitSessionTraceEvent("{}: {}", key, ctx_.execution_stats.counters[i]);
     }
     summary->insert_or_assign("stats", std::move(stats));
   }
@@ -3251,8 +3243,11 @@ std::optional<plan::ProfilingStatsWithTotalTime> PullPlan::Pull(AnyStream *strea
 
   auto stats_and_total_time = GetStatsWithTotalTime(ctx_);
 
-  if (query_logger_) {
-    query_logger_->trace(fmt::format("Profile plan\n{}", ProfilingStatsToJson(stats_and_total_time).dump()));
+  // Guard the JSON serialization: arguments are evaluated before the gate
+  // inside EmitSessionTraceEvent, so without this the .dump() would run even
+  // when tracing is off.
+  if (memgraph::logging::IsSessionTraceEnabled()) {
+    memgraph::logging::EmitSessionTraceEvent("Profile plan\n{}", ProfilingStatsToJson(stats_and_total_time).dump());
   }
 
   return stats_and_total_time;
@@ -3492,18 +3487,18 @@ PreparedQuery PrepareCypherQuery(ParsedQuery parsed_query, std::map<std::string,
   auto hints = plan::ProvidePlanHints(&plan->plan(), plan->symbol_table());
   for (const auto &hint : hints) {
     notifications->emplace_back(SeverityLevel::INFO, NotificationCode::PLAN_HINTING, hint);
-    interpreter.LogQueryMessage(hint);
+    memgraph::logging::EmitSessionTraceEvent("{}", hint);
   }
 
   if (interpreter.IsQueryLoggingActive()) {
     std::stringstream printed_plan;
     plan::PrettyPrint(*dba, &plan->plan(), &printed_plan);
-    interpreter.LogQueryMessage(fmt::format("Explain plan:\n{}", printed_plan.str()));
+    memgraph::logging::EmitSessionTraceEvent("Explain plan:\n{}", printed_plan.str());
   }
 
   PrepareCaching(plan->ast_storage(), frame_change_collector);
   summary->insert_or_assign("cost_estimate", plan->cost());
-  interpreter.LogQueryMessage(fmt::format("Plan cost: {}", plan->cost()));
+  memgraph::logging::EmitSessionTraceEvent("Plan cost: {}", plan->cost());
   bool is_profile_query = false;
   if (interpreter.IsQueryLoggingActive()) {
     is_profile_query = true;
@@ -3540,7 +3535,6 @@ PreparedQuery PrepareCypherQuery(ParsedQuery parsed_query, std::map<std::string,
                                               std::move(user_or_role),
                                               std::move(stopping_context),
                                               dbms::DatabaseProtector{*current_db.db_acc_}.clone(),
-                                              interpreter.query_logger_,
                                               *(*current_db.db_acc_)->metric_handles(),
                                               trigger_context_collector,
                                               memory_limit,
@@ -3610,12 +3604,16 @@ PreparedQuery PrepareExplainQuery(ParsedQuery parsed_query, std::vector<Notifica
   auto hints = plan::ProvidePlanHints(&cypher_query_plan->plan(), cypher_query_plan->symbol_table());
   for (const auto &hint : hints) {
     notifications->emplace_back(SeverityLevel::INFO, NotificationCode::PLAN_HINTING, hint);
-    interpreter.LogQueryMessage(hint);
+    memgraph::logging::EmitSessionTraceEvent("{}", hint);
   }
 
   std::stringstream printed_plan;
   plan::PrettyPrint(*dba, &cypher_query_plan->plan(), &printed_plan);
-  interpreter.LogQueryMessage(fmt::format("Explain plan:\n{}", printed_plan.str()));
+  // PrettyPrint output is needed for the EXPLAIN result rows below regardless;
+  // only the trace emit (and its printed_plan.str() copy) is gated.
+  if (interpreter.IsQueryLoggingActive()) {
+    memgraph::logging::EmitSessionTraceEvent("Explain plan:\n{}", printed_plan.str());
+  }
 
   std::vector<std::vector<TypedValue>> printed_plan_rows;
   for (const auto &row : utils::Split(utils::RTrim(printed_plan.str()), "\n")) {
@@ -3722,7 +3720,7 @@ PreparedQuery PrepareProfileQuery(ParsedQuery parsed_query, bool in_explicit_tra
   auto hints = plan::ProvidePlanHints(&cypher_query_plan->plan(), cypher_query_plan->symbol_table());
   for (const auto &hint : hints) {
     notifications->emplace_back(SeverityLevel::INFO, NotificationCode::PLAN_HINTING, hint);
-    interpreter.LogQueryMessage(hint);
+    memgraph::logging::EmitSessionTraceEvent("{}", hint);
   }
   AccessorCompliance(*cypher_query_plan, *dba);
   const auto rw_type = cypher_query_plan->rw_type();
@@ -3745,10 +3743,9 @@ PreparedQuery PrepareProfileQuery(ParsedQuery parsed_query, bool in_explicit_tra
                                          stopping_context = std::move(stopping_context),
                                          db_acc = *current_db.db_acc_,
                                          hops_limit,
-                                         db_arena_pool = &current_db.db_acc_->get()->Arena(),
-                                         &query_logger = interpreter.query_logger_
+                                         db_arena_pool = &current_db.db_acc_->get()->Arena()
 #ifdef MG_ENTERPRISE
-                                         ,
+                                             ,
                                          parallel_execution,
                                          user_resource = std::move(user_resource)
 #endif
@@ -3765,7 +3762,6 @@ PreparedQuery PrepareProfileQuery(ParsedQuery parsed_query, bool in_explicit_tra
                                         std::move(user_or_role),
                                         std::move(stopping_context),
                                         dbms::DatabaseProtector{db_acc}.clone(),
-                                        query_logger,
                                         *db_acc->metric_handles(),
                                         nullptr,
                                         memory_limit,
@@ -8125,19 +8121,19 @@ PreparedQuery PrepareSessionTraceQuery(ParsedQuery parsed_query, CurrentDB &curr
   handler = [interpreter, enabled = session_trace_query->enabled_] {
     std::vector<std::vector<TypedValue>> results;
 
-    auto query_log_directory = flags::run_time::GetQueryLogDirectory();
-
-    if (query_log_directory.empty()) {
-      throw QueryException("The flag --query-log-directory has to be present in order to enable session trace.");
-    }
-
+    // Session trace is a debugging tool that toggles the structured
+    // query-trace event stream; it does not change the (global) log level.
+    interpreter->GetLogContext()->SetTraceEnabled(enabled);
     if (enabled) {
-      interpreter->query_logger_.emplace(fmt::format("{}/{}.log", query_log_directory, interpreter->session_info_.uuid),
-                                         interpreter->session_info_.uuid,
-                                         interpreter->session_info_.username);
-      interpreter->LogQueryMessage("Session initialized!");
-    } else {
-      interpreter->query_logger_.reset();
+      // Trace events emit at INFO; if the process log level filters INFO out,
+      // the operator would enable tracing and see nothing. Warn them (the WARN
+      // line itself is visible precisely when INFO is filtered).
+      if (!spdlog::should_log(spdlog::level::info)) {
+        spdlog::warn(
+            "SET SESSION TRACE ON: trace events emit at INFO, but --log-level is filtering INFO out. "
+            "Lower --log-level to info (or below) to see them.");
+      }
+      memgraph::logging::EmitSessionTraceEvent("Session initialized!");
     }
 
     results.emplace_back(std::vector<TypedValue>{TypedValue(interpreter->session_info_.uuid)});
@@ -9065,7 +9061,7 @@ void Interpreter::SetCurrentDB() { current_db_.SetCurrentDB(interpreter_context_
 
 Interpreter::ParseRes Interpreter::Parse(const std::string &query_string, UserParameters_fn params_getter,
                                          QueryExtras const &extras) {
-  LogQueryMessage(fmt::format("Accepted query: {}", query_string));
+  memgraph::logging::EmitSessionTraceEvent("Accepted query: {}", query_string);
 #ifdef MG_ENTERPRISE
   if (!flags::CoordinationSetupInstance().IsCoordinator()) {
     MG_ASSERT(user_or_role_, "Trying to prepare a query without a query user.");
@@ -9102,7 +9098,7 @@ Interpreter::ParseRes Interpreter::Parse(const std::string &query_string, UserPa
     }
     // NOTE: query_string is not BEGIN, COMMIT or ROLLBACK
     const utils::Timer parsing_timer;
-    LogQueryMessage("Query parsing started.");
+    memgraph::logging::EmitSessionTraceEvent("Query parsing started.");
     std::string database_uuid;
     if (current_db_.db_acc_) database_uuid = std::string{current_db_.db_acc_->get()->uuid()};
     ParsedQuery parsed_query = ParseQuery(query_string,
@@ -9112,10 +9108,10 @@ Interpreter::ParseRes Interpreter::Parse(const std::string &query_string, UserPa
                                           database_uuid,
                                           interpreter_context_->parameters);
     auto parsing_time = parsing_timer.Elapsed().count();
-    LogQueryMessage("Query parsing ended.");
+    memgraph::logging::EmitSessionTraceEvent("Query parsing ended.");
     return Interpreter::ParseInfo{.parsed_query = std::move(parsed_query), .parsing_time = parsing_time};
   } catch (const utils::BasicException &e) {
-    LogQueryMessage(fmt::format("Failed query: {}", e.what()));
+    memgraph::logging::EmitSessionTraceEvent("Failed query: {}", e.what());
     // Trigger first failed query
     metrics::FirstFailedQuery();
     // db_acc_ may be absent if the query fails before USE DATABASE; fall back to global counter.
@@ -9377,8 +9373,8 @@ Interpreter::PrepareResult Interpreter::Prepare(ParseRes parse_res, UserParamete
     }
 
     SetupInterpreterTransaction(extras);
-    LogQueryMessage(fmt::format(
-        "Query [{}] associated with transaction [{}]", parsed_query.query_string, current_transaction_.value_or(0)));
+    memgraph::logging::EmitSessionTraceEvent(
+        "Query [{}] associated with transaction [{}]", parsed_query.query_string, current_transaction_.value_or(0));
   }
 
   auto *const cypher_query = utils::Downcast<CypherQuery>(parsed_query.query);
@@ -9423,7 +9419,7 @@ Interpreter::PrepareResult Interpreter::Prepare(ParseRes parse_res, UserParamete
         in_explicit_transaction_ ? static_cast<int>(query_executions_.size() - 1) : std::optional<int>{};
 
     query_execution->summary["parsing_time"] = parse_info.parsing_time;
-    LogQueryMessage(fmt::format("Query parsing time: {}", parse_info.parsing_time));
+    memgraph::logging::EmitSessionTraceEvent("Query parsing time: {}", parse_info.parsing_time);
 
     // Set a default cost estimate of 0. Individual queries can overwrite this
     // field with an improved estimate.
@@ -9486,7 +9482,7 @@ Interpreter::PrepareResult Interpreter::Prepare(ParseRes parse_res, UserParamete
     }
 
     const utils::Timer planning_timer;  // TODO: Think about moving it to Parse()
-    LogQueryMessage("Query planning started!");
+    memgraph::logging::EmitSessionTraceEvent("Query planning started!");
     PreparedQuery prepared_query;
     utils::MemoryResource *memory_resource = query_execution->resource();
     frame_change_collector_.reset();
@@ -9777,8 +9773,8 @@ Interpreter::PrepareResult Interpreter::Prepare(ParseRes parse_res, UserParamete
     auto planning_time = planning_timer.Elapsed().count();
     query_execution->summary["planning_time"] = planning_time;
     query_execution->prepared_query.emplace(std::move(prepared_query));
-    LogQueryMessage("Query planning ended.");
-    LogQueryMessage(fmt::format("Query planning time: {}", planning_time));
+    memgraph::logging::EmitSessionTraceEvent("Query planning ended.");
+    memgraph::logging::EmitSessionTraceEvent("Query planning time: {}", planning_time);
 
     const auto rw_type = query_execution->prepared_query->rw_type;
     query_execution->summary["type"] = plan::ReadWriteTypeChecker::TypeToString(rw_type);
@@ -9841,7 +9837,7 @@ Interpreter::PrepareResult Interpreter::Prepare(ParseRes parse_res, UserParamete
             .qid = qid,
             .db = query_execution->prepared_query->db};
   } catch (const utils::BasicException &e) {
-    LogQueryMessage(fmt::format("Failed query: {}", e.what()));
+    memgraph::logging::EmitSessionTraceEvent("Failed query: {}", e.what());
     // Trigger first failed query
     metrics::FirstFailedQuery();
     // db_acc_ may be absent if the query fails before USE DATABASE; fall back to global counter.
@@ -9886,9 +9882,7 @@ void Interpreter::SetupInterpreterTransaction(const QueryExtras &extras) {
   transaction_start_steady_ = std::chrono::steady_clock::now();
   // Release publishes the start-time writes above to verifier-holding readers.
   transaction_status_.store(TransactionStatus::ACTIVE, std::memory_order_release);
-  if (query_logger_) {
-    query_logger_->SetTransactionId(std::to_string(tx_id));
-  }
+  session_log_ctx_.SetTxId(std::to_string(tx_id));
   metadata_ = GenOptional(extras.metadata_pv);
 }
 
@@ -9912,12 +9906,10 @@ void Interpreter::Abort() {
   }
 #endif
 
-  LogQueryMessage("Query abort started.");
+  memgraph::logging::EmitSessionTraceEvent("Query abort started.");
   utils::OnScopeExit const abort_end([this]() {
-    this->LogQueryMessage("Query abort ended.");
-    if (query_logger_) {
-      query_logger_->ResetTransactionId();
-    }
+    memgraph::logging::EmitSessionTraceEvent("Query abort ended.");
+    this->session_log_ctx_.ClearTxId();
   });
 
   // System tx
@@ -10122,12 +10114,10 @@ void Interpreter::Commit() {
   }
 #endif
 
-  LogQueryMessage("Query commit started.");
+  memgraph::logging::EmitSessionTraceEvent("Query commit started.");
   utils::OnScopeExit const commit_end([this]() {
-    this->LogQueryMessage("Query commit ended.");
-    if (query_logger_) {
-      query_logger_->ResetTransactionId();
-    }
+    memgraph::logging::EmitSessionTraceEvent("Query commit ended.");
+    this->session_log_ctx_.ClearTxId();
   });
 
   // It's possible that some queries did not finish because the user did
@@ -10372,9 +10362,7 @@ void Interpreter::Commit() {
     throw ReplicationException(*replication_error_msg);
   }
 
-  if (IsQueryLoggingActive()) {
-    query_logger_->trace("Commit successfully finished!");
-  }
+  memgraph::logging::EmitSessionTraceEvent("Commit successfully finished!");
 }
 
 void Interpreter::AdvanceCommand() {
@@ -10415,13 +10403,8 @@ void Interpreter::SetSessionIsolationLevel(const storage::IsolationLevel isolati
 void Interpreter::SetUser(std::shared_ptr<QueryUserOrRole> user_or_role,
                           std::shared_ptr<utils::UserResources> user_resource) {
   user_or_role_ = std::move(user_or_role);
-  if (query_logger_) {
-    std::string username;
-    if (user_or_role_ && user_or_role_->username()) {
-      username = user_or_role_->username().value();
-    }
-    query_logger_->SetUser(username);
-  }
+  session_log_ctx_.SetUser((user_or_role_ && user_or_role_->username()) ? user_or_role_->username().value()
+                                                                        : std::string{});
   // Pre-existsing user resource; decrement session (since it is not being used anymore)
   if (user_resource_) {
     user_resource_->DecrementSessions();
@@ -10438,28 +10421,22 @@ void Interpreter::SetUser(std::shared_ptr<QueryUserOrRole> user_or_role,
 #else
 void Interpreter::SetUser(std::shared_ptr<QueryUserOrRole> user_or_role) {
   user_or_role_ = std::move(user_or_role);
-  if (query_logger_) {
-    std::string username;
-    if (user_or_role_ && user_or_role_->username()) {
-      username = user_or_role_->username().value();
-    }
-    query_logger_->SetUser(username);
-  }
+  session_log_ctx_.SetUser((user_or_role_ && user_or_role_->username()) ? user_or_role_->username().value()
+                                                                        : std::string{});
 }
 #endif
 
 void Interpreter::SetSessionInfo(std::string uuid, std::string username, std::string login_timestamp) {
-  session_info_ = {.uuid = uuid, .username = username, .login_timestamp = login_timestamp};
-  if (query_logger_) {
-    query_logger_->SetSessionId(uuid);
-  }
+  // SetSessionUuid takes its argument by value (copies), so hand it uuid before
+  // moving uuid into the aggregate below — one copy total instead of two.
+  session_log_ctx_.SetSessionUuid(uuid);
+  session_info_ = {
+      .uuid = std::move(uuid), .username = std::move(username), .login_timestamp = std::move(login_timestamp)};
 }
 
 void Interpreter::ResetUser() {
   user_or_role_.reset();
-  if (query_logger_) {
-    query_logger_->ResetUser();
-  }
+  session_log_ctx_.ClearUser();
 #ifdef MG_ENTERPRISE
   if (user_resource_) {
     user_resource_->DecrementSessions();
@@ -10468,12 +10445,10 @@ void Interpreter::ResetUser() {
 #endif
 }
 
-bool Interpreter::IsQueryLoggingActive() const { return query_logger_.has_value(); }
-
-void Interpreter::LogQueryMessage(std::string message) {
-  if (query_logger_) {
-    (*query_logger_).trace(message);
-  }
+bool Interpreter::IsQueryLoggingActive() const {
+  // "Active" = the user has run SET SESSION TRACE ON for this session,
+  // turning on the structured query-trace debugging stream.
+  return session_log_ctx_.trace_enabled();
 }
 
 }  // namespace memgraph::query
