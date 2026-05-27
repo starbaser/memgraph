@@ -9,41 +9,39 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+// Tests for TypedEGraph, the typed Make<S>() wrapper over the core e-graph.
+// Structural hash-consing (children, order, symbol distinctness) belongs to the
+// core EGraph and is covered in unittest__egraph.cpp; here we test only what the
+// typed layer itself owns:
+//   - Make lowers to the same node a hand-written core emplace would produce.
+//   - Make's disambiguator branch, reached via a stateful interning trait.
+//   - storage<S>() recovers the per-symbol side-data Make wrote.
+//   - SymbolMakeTraits rejects ill-formed traits at the constraint.
+
 #include <cstdint>
 #include <map>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <gtest/gtest.h>
 
+#include "test_support/op_make_traits.hpp"
 #include "utils/small_vector.hpp"
-
-import memgraph.planner.core.egraph;
-import memgraph.planner.core.typed_egraph;
 
 namespace memgraph::planner::core {
 namespace {
 
-/// Synthetic symbol set covering the three trait shapes the protocol must
-/// support: nullary leaf with no storage, leaf that interns user data via
-/// a disambiguator, and an N-ary node with children.
-enum class ToyOp : std::uint8_t {
-  Once,    // nullary, no storage, no disambiguator
-  Symbol,  // leaf, interns (name) -> id used as disambiguator
-  Add,     // binary, no storage, no disambiguator
-};
+// A minimal symbol set whose only trait interns user data: make() records the
+// name in per-symbol storage and returns the interned id as the disambiguator.
+// This reaches the half of Make's dispatch that the production-like `Op` set
+// (no storage, no disambiguator) never exercises.
+enum class ToyOp : std::uint8_t { Symbol };
 
 struct ToyAnalysis {};
 
 template <ToyOp S>
 struct toy_traits;
-
-template <>
-struct toy_traits<ToyOp::Once> {
-  struct storage_type {};
-
-  static auto make(storage_type & /*s*/) -> LoweredNode { return {.children = {}, .disambiguator = std::nullopt}; }
-};
 
 template <>
 struct toy_traits<ToyOp::Symbol> {
@@ -61,49 +59,58 @@ struct toy_traits<ToyOp::Symbol> {
   }
 };
 
-template <>
-struct toy_traits<ToyOp::Add> {
+using ToyEGraph = TypedEGraph<ToyOp, ToyAnalysis, SymbolSequence<ToyOp, ToyOp::Symbol>, toy_traits>;
+
+// A trait whose make() returns the wrong type, for the negative concept check.
+struct BadTraits {
   struct storage_type {};
 
-  static auto make(storage_type & /*s*/, EClassId lhs, EClassId rhs) -> LoweredNode {
-    return {.children = utils::small_vector<EClassId>{lhs, rhs}, .disambiguator = std::nullopt};
-  }
+  static auto make(storage_type &) -> int { return 0; }
 };
 
-using ToySeq = SymbolSequence<ToyOp, ToyOp::Once, ToyOp::Symbol, ToyOp::Add>;
-using ToyEGraph = TypedEGraph<ToyOp, ToyAnalysis, ToySeq, toy_traits>;
+}  // namespace
 
-TEST(TypedEGraph, MakeLeafWithoutDisambiguator) {
-  ToyEGraph eg;
-  auto const a = eg.Make<ToyOp::Once>();
-  auto const b = eg.Make<ToyOp::Once>();
-  // Same leaf with no disambiguator hash-conses to the same e-class.
-  EXPECT_EQ(a, b);
-  EXPECT_EQ(eg.core().num_classes(), 1u);
+// === Make: lowering parity with the core e-graph (S1) ===
+
+TEST(TypedEGraph, MakeMatchesRawEmplace) {
+  test::TypedTestEGraph eg;
+  auto const x = eg.Make<test::Op::Var>();
+  auto const y = eg.Make<test::Op::Const>();
+
+  // Make<S>(args...) lowers to exactly the node a caller would emplace by hand.
+  auto const sum = eg.Make<test::Op::Add>(x, y);
+  auto const sum_raw = eg.core().emplace(test::Op::Add, utils::small_vector<EClassId>{x, y}).eclass_id;
+  EXPECT_EQ(sum, sum_raw);
+
+  // Children are positional: the wrapper does not canonicalise their order.
+  EXPECT_NE(sum, eg.Make<test::Op::Add>(y, x));
+
+  // A vector-argument trait forwards its children the same way, so identical
+  // n-ary nodes hash-cons to one class.
+  EXPECT_EQ(eg.Make<test::Op::F>(std::vector<EClassId>{x, y}), eg.Make<test::Op::F>(std::vector<EClassId>{x, y}));
 }
 
-TEST(TypedEGraph, MakeLeafInternsByName) {
+// === Make: the disambiguator branch via interning (S2, S3) ===
+
+TEST(TypedEGraph, InterningReusesClassForSameKey) {
   ToyEGraph eg;
   auto const x1 = eg.Make<ToyOp::Symbol>(std::string_view{"x"});
   auto const x2 = eg.Make<ToyOp::Symbol>(std::string_view{"x"});
-  auto const y = eg.Make<ToyOp::Symbol>(std::string_view{"y"});
   EXPECT_EQ(x1, x2);
-  EXPECT_NE(x1, y);
-  EXPECT_EQ(eg.core().num_classes(), 2u);
+  EXPECT_EQ(eg.core().num_classes(), 1u);
 }
 
-TEST(TypedEGraph, MakeBinaryNodeWithChildren) {
+TEST(TypedEGraph, InterningSeparatesDistinctKeys) {
   ToyEGraph eg;
   auto const x = eg.Make<ToyOp::Symbol>(std::string_view{"x"});
   auto const y = eg.Make<ToyOp::Symbol>(std::string_view{"y"});
-  auto const xy_1 = eg.Make<ToyOp::Add>(x, y);
-  auto const xy_2 = eg.Make<ToyOp::Add>(x, y);
-  EXPECT_EQ(xy_1, xy_2);
-  // x, y, Add(x,y): three classes.
-  EXPECT_EQ(eg.core().num_classes(), 3u);
+  EXPECT_NE(x, y);
+  EXPECT_EQ(eg.core().num_classes(), 2u);
 }
 
-TEST(TypedEGraph, StorageAccessReadsInternedNames) {
+// === storage<S>(): per-symbol side-data recovery (S4) ===
+
+TEST(TypedEGraph, StorageReflectsInternedEntries) {
   ToyEGraph eg;
   eg.Make<ToyOp::Symbol>(std::string_view{"alice"});
   eg.Make<ToyOp::Symbol>(std::string_view{"bob"});
@@ -114,26 +121,10 @@ TEST(TypedEGraph, StorageAccessReadsInternedNames) {
   EXPECT_TRUE(store.by_name.contains("bob"));
 }
 
-TEST(TypedEGraph, CoreAccessorReachesUnderlyingEGraph) {
-  ToyEGraph eg;
-  eg.Make<ToyOp::Once>();
-  EGraph<ToyOp, ToyAnalysis> const &core = eg.core();
-  EXPECT_EQ(core.num_classes(), 1u);
-  EXPECT_EQ(core.num_nodes(), 1u);
-}
+// === SymbolMakeTraits: trait protocol enforcement (S5) ===
 
-// Compile-time check: a traits type whose make() returns the wrong type
-// must be rejected by SymbolMakeTraits at the constraint.
-struct BadTraits {
-  struct storage_type {};
+static_assert(SymbolMakeTraits<toy_traits<ToyOp::Symbol>, std::string_view>,
+              "a well-formed interning trait satisfies the protocol");
+static_assert(!SymbolMakeTraits<BadTraits>, "make() returning non-LoweredNode is rejected");
 
-  static auto make(storage_type &) -> int { return 0; }
-};
-
-static_assert(!SymbolMakeTraits<BadTraits>, "make() returning non-LoweredNode should fail the concept");
-
-// Compile-time check: a well-formed nullary trait satisfies the concept.
-static_assert(SymbolMakeTraits<toy_traits<ToyOp::Once>>);
-
-}  // namespace
 }  // namespace memgraph::planner::core

@@ -6,7 +6,6 @@ add_unit_test(planner
         unittest__enode.cpp
         unittest__egraph.cpp
         unittest__typed_egraph.cpp
-        unittest__typed_egraph_op.cpp
         unittest__extractor.cpp
         unittest__pattern.cpp
         unittest__match_arena.cpp
