@@ -41,6 +41,8 @@ struct InstanceStatus;
 
 namespace memgraph::metrics {
 
+inline prometheus::Histogram::BucketBoundaries const kThroughputBuckets{1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9};
+
 struct MetricInfo {
   std::string name;
   std::string type;
@@ -349,6 +351,13 @@ class PrometheusMetrics {
   void RebindDefaultDatabaseUUID(utils::UUID const &new_uuid);
   void UpdateGauges();
 
+  void ObserveSnapshotThroughput(std::string const &instance_name, double bytes_per_second);
+  void ObserveWalThroughput(std::string const &instance_name, double bytes_per_second);
+
+  // Drops the per-instance replication throughput series (snapshot + WAL) for `instance_name`. Call when a replica is
+  // unregistered so the throughput maps and the registry don't grow unbounded across the main's lifetime.
+  void RemoveReplicationThroughput(std::string_view instance_name);
+
   void SetStorageSnapshotResolver(StorageSnapshotResolver resolver);
 #ifdef MG_ENTERPRISE
   void SetInstanceStatusResolver(InstanceStatusResolver resolver);
@@ -379,6 +388,30 @@ class PrometheusMetrics {
     std::string db_name;
     DatabaseMetricHandles handles;
   };
+
+  template <typename ThroughputInfo>
+  void ObserveDurabilityThroughput(std::string const &instance_name, double bytes_per_second,
+                                   prometheus::Family<prometheus::Histogram> &throughput_family,
+                                   ThroughputInfo &throughput) {
+    std::lock_guard const lock{throughput.mutex};
+    auto it = throughput.by_instance.find(instance_name);
+    if (it == throughput.by_instance.end()) {
+      prometheus::Labels const labels{{"mg_instance", instance_name}};
+      it = throughput.by_instance.emplace(instance_name, &throughput_family.Add(labels, kThroughputBuckets)).first;
+    }
+    it->second->Observe(bytes_per_second);
+  }
+
+  template <typename ThroughputInfo>
+  void RemoveDurabilityThroughput(std::string const &instance_name,
+                                  prometheus::Family<prometheus::Histogram> &throughput_family,
+                                  ThroughputInfo &throughput) {
+    std::lock_guard const lock{throughput.mutex};
+    if (auto it = throughput.by_instance.find(instance_name); it != throughput.by_instance.end()) {
+      throughput_family.Remove(it->second);
+      throughput.by_instance.erase(it);
+    }
+  }
 
   StorageSnapshot ResolveStorageSnapshot(utils::UUID const &uuid) const;
 
@@ -596,6 +629,20 @@ class PrometheusMetrics {
   // Per-database metric families — GC histograms
   prometheus::Family<prometheus::Histogram> &gc_latency_family_;
   prometheus::Family<prometheus::Histogram> &gc_skiplist_cleanup_latency_family_;
+
+  // Global metric family — per-instance snapshot throughput (bytes/s)
+  prometheus::Family<prometheus::Histogram> &snapshot_throughput_family_;
+  prometheus::Family<prometheus::Histogram> &wal_throughput_family_;
+
+  struct {
+    std::mutex mutex;
+    std::unordered_map<std::string, prometheus::Histogram *> by_instance;
+  } snapshot_throughput_;
+
+  struct {
+    std::mutex mutex;
+    std::unordered_map<std::string, prometheus::Histogram *> by_instance;
+  } wal_throughput_;
 
 #ifdef MG_ENTERPRISE
   // Global metric families — HA instance status

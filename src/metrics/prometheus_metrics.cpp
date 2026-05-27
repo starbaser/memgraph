@@ -76,7 +76,6 @@ bool IsLegacyCoordinatorDeltaMetric(std::string_view name) {
 // 15 buckets covering 10µs to 60s
 prometheus::Histogram::BucketBoundaries const kLatencyBuckets{
     0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0};
-
 }  // namespace
 
 PrometheusMetrics::PrometheusMetrics()
@@ -751,7 +750,16 @@ PrometheusMetrics::PrometheusMetrics()
       gc_skiplist_cleanup_latency_family_{prometheus::BuildHistogram()
                                               .Name("memgraph_gc_skiplist_cleanup_latency_seconds")
                                               .Help("GC skiplist cleanup latency in seconds")
-                                              .Register(registry_)}
+                                              .Register(registry_)},
+      snapshot_throughput_family_{prometheus::BuildHistogram()
+                                      .Name("memgraph_snapshot_throughput_bytes_per_second")
+                                      .Help("Throughput of snapshot sent to each replica during recovery, in bytes/s")
+                                      .Register(registry_)},
+
+      wal_throughput_family_{prometheus::BuildHistogram()
+                                 .Name("memgraph_wal_throughput_bytes_per_second")
+                                 .Help("Throughput of WAL files sent to each replica during recovery, in bytes/s")
+                                 .Register(registry_)}
 #ifdef MG_ENTERPRISE
       ,
       instance_up_family_{prometheus::BuildGauge()
@@ -1206,6 +1214,20 @@ void PrometheusMetrics::UpdateGauges() {
         ->Set(static_cast<double>(inst.last_succ_resp_ms) / 1000.0);
   }
 #endif
+}
+
+void PrometheusMetrics::ObserveSnapshotThroughput(std::string const &instance_name, double const bytes_per_second) {
+  ObserveDurabilityThroughput(instance_name, bytes_per_second, snapshot_throughput_family_, snapshot_throughput_);
+}
+
+void PrometheusMetrics::ObserveWalThroughput(std::string const &instance_name, double const bytes_per_second) {
+  ObserveDurabilityThroughput(instance_name, bytes_per_second, wal_throughput_family_, wal_throughput_);
+}
+
+void PrometheusMetrics::RemoveReplicationThroughput(std::string_view const instance_name) {
+  std::string const name{instance_name};
+  RemoveDurabilityThroughput(name, snapshot_throughput_family_, snapshot_throughput_);
+  RemoveDurabilityThroughput(name, wal_throughput_family_, wal_throughput_);
 }
 
 namespace {

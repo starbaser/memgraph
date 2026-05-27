@@ -10,11 +10,17 @@
 // licenses/APL.txt.
 #pragma once
 
+#include <chrono>
+#include <string>
+#include <system_error>
+#include <type_traits>
+
 #include "metrics/prometheus_metrics.hpp"
 #include "metrics/scoped_histogram_timer.hpp"
 #include "rpc/messages.hpp"
 #include "storage/v2/durability/durability.hpp"
 #include "storage/v2/replication/recovery.hpp"
+#include "storage/v2/replication/rpc.hpp"
 
 namespace memgraph::storage {
 template <rpc::IsRpc T>
@@ -65,11 +71,32 @@ bool WriteFiles(const T &paths, std::filesystem::path const &root_data_dir, repl
   return true;
 }
 
+template <typename T>
+  requires(std::is_same_v<T, std::filesystem::path>)
+uint64_t TotalFileBytes(const T &path) {
+  std::error_code ec;
+  auto const size = std::filesystem::file_size(path, ec);
+  return ec ? uint64_t{0} : size;
+}
+
+template <typename T>
+  requires(std::is_same_v<T, std::vector<std::filesystem::path>>)
+uint64_t TotalFileBytes(const T &paths) {
+  uint64_t total = 0;
+  for (auto const &path : paths) {
+    std::error_code ec;
+    if (auto const size = std::filesystem::file_size(path, ec); !ec) {
+      total += size;
+    }
+  }
+  return total;
+}
+
 template <rpc::IsRpc T, typename R, typename... Args>
 std::optional<typename T::Response> TransferDurabilityFiles(const R &files, rpc::Client &client,
                                                             std::filesystem::path const &root_data_dir,
                                                             replication_coordination_glue::ReplicationMode const mode,
-                                                            Args &&...args) {
+                                                            std::string const &instance_name, Args &&...args) {
   metrics::ScopedHistogramTimer const timer{RpcInfo<T>::histogram()};
   std::optional<rpc::Client::StreamHandler<T>> maybe_stream_result;
 
@@ -87,8 +114,10 @@ std::optional<typename T::Response> TransferDurabilityFiles(const R &files, rpc:
     return std::nullopt;
   }
 
-  slk::Builder *builder = maybe_stream_result->GetBuilder();
+  // intentionally don't take into account waiting for RPC lock
+  auto const transfer_start = std::chrono::steady_clock::now();
 
+  slk::Builder *builder = maybe_stream_result->GetBuilder();
   builder->FlushSegment(/*final_segment*/ false, /*force_flush*/ true);
 
   // If writing files failed, fail the task by returning empty optional
@@ -96,7 +125,19 @@ std::optional<typename T::Response> TransferDurabilityFiles(const R &files, rpc:
     return std::nullopt;
   }
 
-  return maybe_stream_result->SendAndWaitProgress();
+  auto response = maybe_stream_result->SendAndWaitProgress();
+
+  // Record per-instance recovery throughput (bytes/s) so a slow replication link can be identified.
+  auto const elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - transfer_start).count();
+  if (auto const total_bytes = TotalFileBytes(files); elapsed_seconds > 0.0 && total_bytes > 0) {
+    if constexpr (std::is_same_v<T, replication::SnapshotRpc>) {
+      metrics::Metrics().ObserveSnapshotThroughput(instance_name, static_cast<double>(total_bytes) / elapsed_seconds);
+    } else if constexpr (std::is_same_v<T, replication::WalFilesRpc> || std::is_same_v<T, replication::CurrentWalRpc>) {
+      metrics::Metrics().ObserveWalThroughput(instance_name, static_cast<double>(total_bytes) / elapsed_seconds);
+    }
+  }
+
+  return response;
 }
 
 auto GetRecoverySteps(uint64_t replica_commit, utils::FileRetainer::FileLocker *file_locker,
