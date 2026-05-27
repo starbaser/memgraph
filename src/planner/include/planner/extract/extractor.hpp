@@ -43,10 +43,10 @@ namespace memgraph::planner::core::extract {
 ///   a.resolve()             - (enode_id, cost const&) of the chosen alt;
 ///                             reference is valid for the frontier's lifetime
 template <typename CR>
-concept CostResultType = std::copyable<CR> && requires(CR &a, CR &&r, CR const &c) {
+concept CostResultType = std::copyable<CR> && requires(CR &a, CR const &c) {
   typename CR::cost_t;
   requires std::totally_ordered<typename CR::cost_t>;
-  { a.merge_in_place(std::move(r)) };
+  { a.merge_in_place(std::declval<CR>()) };
   { c.resolve() } -> std::same_as<std::pair<ENodeId, typename CR::cost_t const &>>;
 };
 
