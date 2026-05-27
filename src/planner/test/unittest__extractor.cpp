@@ -723,10 +723,9 @@ TEST(ParetoFrontier_Prune, NoneDominated) {
 }
 
 TEST(ParetoFrontier_Prune, AllDominatedByOne) {
-  // Alt B (cost=1, req={}) dominates both A (cost=2, req={1}) and C (cost=3, req={2}).
-  // dominated_by checks: other.cost <= cost && required ⊇ other.required
-  // A.dominated_by(B): B.cost=1 <= 2 && {1} ⊇ {} → true
-  // C.dominated_by(B): B.cost=1 <= 3 && {2} ⊇ {} → true
+  // B (cost=1, req={}) dominates two mutually-incomparable alts: A (cost=2,
+  // req={1}) and C (cost=3, req={2}).  A dominator with lower cost and a subset
+  // required-set wins on both axes, so only B survives.
   auto frontier = TestFrontier{{
       {.cost = 2.0, .required = {1}, .enode_id = ENodeId{0}},  // A: dominated by B
       {.cost = 1.0, .required = {}, .enode_id = ENodeId{1}},   // B: dominator
@@ -745,35 +744,6 @@ TEST(ParetoFrontier_Prune, DuplicateAlternatives) {
   }};
   ASSERT_EQ(frontier.alts().size(), 1);
   EXPECT_TRUE(frontier.alts()[0].enode_id == ENodeId{0} || frontier.alts()[0].enode_id == ENodeId{1});
-}
-
-TEST(ParetoFrontier_Prune, TransitiveDominance) {
-  // A dominates B, B dominates C. After prune, only A survives.
-  // A: cost=1, req={}
-  // B: cost=2, req={1}    - A dominates B: A.cost<=B.cost && B.req ⊇ A.req → 1<=2 && {1}⊇{} → true
-  // C: cost=3, req={1,2}  - B dominates C: B.cost<=C.cost && C.req ⊇ B.req → 2<=3 && {1,2}⊇{1} → true
-  //                        - A dominates C: 1<=3 && {1,2}⊇{} → true (transitivity)
-  // The break optimization: when i=1 (B) is checked, it gets marked dominated by i=0 (A)
-  // in the i=0 loop, so B is skipped. C is also marked dominated in the i=0 loop.
-  auto frontier = TestFrontier{{
-      {.cost = 1.0, .required = {}, .enode_id = ENodeId{0}},      // A
-      {.cost = 2.0, .required = {1}, .enode_id = ENodeId{1}},     // B
-      {.cost = 3.0, .required = {1, 2}, .enode_id = ENodeId{2}},  // C
-  }};
-  ASSERT_EQ(frontier.alts().size(), 1);
-  ASSERT_EQ(frontier.alts()[0].enode_id, ENodeId{0}) << "Only A should survive (dominates B and C)";
-
-  // Also test with reversed input order to exercise the break optimization path.
-  // When C is at index 0: i=0(C), j=1(B): C.dominated_by(B) → true → dominated[0]=true, break
-  // Then i=1(B), j=2(A): B.dominated_by(A) → true → dominated[1]=true, break
-  // Then i=2(A): survives.
-  auto frontier_reversed = TestFrontier{{
-      {.cost = 3.0, .required = {1, 2}, .enode_id = ENodeId{2}},  // C
-      {.cost = 2.0, .required = {1}, .enode_id = ENodeId{1}},     // B
-      {.cost = 1.0, .required = {}, .enode_id = ENodeId{0}},      // A
-  }};
-  ASSERT_EQ(frontier_reversed.alts().size(), 1);
-  ASSERT_EQ(frontier_reversed.alts()[0].enode_id, ENodeId{0}) << "Only A should survive regardless of input order";
 }
 
 TEST(ParetoFrontier_Prune, TransitiveDominance_AllPermutations) {
