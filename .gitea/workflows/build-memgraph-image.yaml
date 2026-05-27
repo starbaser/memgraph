@@ -43,7 +43,7 @@ jobs:
             --toolchain "$TOOLCHAIN" \
             --os "$OS" \
             --arch "$ARCH" \
-            run --custom-mirror true
+            run --custom-mirror false
 
       - name: Build Memgraph binaries
         run: |
@@ -107,7 +107,7 @@ jobs:
             --dest-dir "$DOCKER_ARTIFACT_DIR" \
             --generate-sbom false \
             --malloc false \
-            --custom-mirror true \
+            --custom-mirror false \
             --keep-image-loaded true
 
           image_archive="$(ls -1t "$DOCKER_ARTIFACT_DIR"/memgraph*-docker.tar.gz 2>/dev/null | head -n 1)"
