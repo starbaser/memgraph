@@ -793,9 +793,111 @@ TEST(ParetoFrontier_Prune, TransitiveDominance_AllPermutations) {
   }
 }
 
+TEST(ParetoFrontier_Prune, CandidateEvictsMiddleSurvivor) {
+  // Survivors P, Q, R are mutually incomparable, so all three are retained as a
+  // candidate is processed.  A later candidate K dominates only Q (the middle
+  // survivor) and is incomparable to P and R.  Q must be evicted while P and R
+  // survive: the surviving neighbour after the evicted hole has to be relocated.
+  // P: cost=1, req={1,2,3}   Q: cost=2, req={1,2}   R: cost=3, req={4}
+  // K: cost=2, req={1}  dominates Q (cost<=, req subset), incomparable to P, R.
+  auto frontier = TestFrontier{{
+      {.cost = 1.0, .required = {1, 2, 3}, .enode_id = ENodeId{0}},  // P
+      {.cost = 2.0, .required = {1, 2}, .enode_id = ENodeId{1}},     // Q (evicted)
+      {.cost = 3.0, .required = {4}, .enode_id = ENodeId{2}},        // R
+      {.cost = 2.0, .required = {1}, .enode_id = ENodeId{3}},        // K
+  }};
+  auto survivors = frontier.alts();
+  ASSERT_EQ(survivors.size(), 3);
+  auto ids = std::set<ENodeId>{};
+  for (auto const &alt : survivors) ids.insert(alt.enode_id);
+  EXPECT_EQ(ids, (std::set<ENodeId>{ENodeId{0}, ENodeId{2}, ENodeId{3}})) << "Q (id 1) is the only eviction";
+}
+
+TEST(ParetoFrontier_Prune, CandidateEvictsMultipleSurvivors) {
+  // Survivors P0..P3 are mutually incomparable.  Candidate K dominates the two
+  // middle survivors P1 and P2 while incomparable to P0 and P3.  Both are
+  // evicted in a single scan and the outer survivors are compacted past the two
+  // holes, leaving {P0, P3, K}.
+  // P0: cost=1,req={1,2,3,4}  P1: cost=2,req={1,2,3}  P2: cost=3,req={1,2}
+  // P3: cost=4,req={1}        K:  cost=2,req={1,2} dominates P1 and P2 only.
+  auto frontier = TestFrontier{{
+      {.cost = 1.0, .required = {1, 2, 3, 4}, .enode_id = ENodeId{0}},  // P0
+      {.cost = 2.0, .required = {1, 2, 3}, .enode_id = ENodeId{1}},     // P1 (evicted)
+      {.cost = 3.0, .required = {1, 2}, .enode_id = ENodeId{2}},        // P2 (evicted)
+      {.cost = 4.0, .required = {1}, .enode_id = ENodeId{3}},           // P3
+      {.cost = 2.0, .required = {1, 2}, .enode_id = ENodeId{4}},        // K
+  }};
+  auto survivors = frontier.alts();
+  ASSERT_EQ(survivors.size(), 3);
+  auto ids = std::set<ENodeId>{};
+  for (auto const &alt : survivors) ids.insert(alt.enode_id);
+  EXPECT_EQ(ids, (std::set<ENodeId>{ENodeId{0}, ENodeId{3}, ENodeId{4}})) << "P1 and P2 both evicted by K";
+}
+
 // ========================================
 // ParetoFrontier::merge_in_place Tests
 // ========================================
+
+TEST(ParetoFrontier_MergeInPlace, DominatedIncomingRetainsAllSurvivors) {
+  // PF_A holds three mutually-incomparable survivors P0, P1, P2.  The incoming
+  // alt Q is incomparable to P0 but dominated by P1, so the prefix scan stops at
+  // P1 with P2 still uninspected in the tail.  Q is dropped and all three
+  // original survivors must remain - the untested tail is not truncated.
+  auto pf_a = TestFrontier{{
+      {.cost = 1.0, .required = {1, 2, 3}, .enode_id = ENodeId{0}},  // P0
+      {.cost = 2.0, .required = {1, 2}, .enode_id = ENodeId{1}},     // P1 dominates Q
+      {.cost = 3.0, .required = {4}, .enode_id = ENodeId{2}},        // P2 (untested tail)
+  }};
+  auto pf_b = TestFrontier{{{.cost = 3.0, .required = {1, 2, 5}, .enode_id = ENodeId{3}}}};  // Q
+  pf_a.merge_in_place(std::move(pf_b));
+  auto survivors = pf_a.alts();
+  ASSERT_EQ(survivors.size(), 3);
+  auto ids = std::set<ENodeId>{};
+  for (auto const &alt : survivors) ids.insert(alt.enode_id);
+  EXPECT_EQ(ids, (std::set<ENodeId>{ENodeId{0}, ENodeId{1}, ENodeId{2}})) << "Q dropped, every prefix survivor kept";
+}
+
+TEST(ParetoFrontier_MergeInPlace, IncomingEvictsMiddlePrefixSurvivor) {
+  // PF_A holds three mutually-incomparable survivors P0, P1, P2.  The incoming
+  // alt Q dominates the middle survivor P1 but is incomparable to P0 and P2.
+  // P1 is evicted while P0, P2 and Q survive: the survivor past the evicted hole
+  // (P2) is compacted down inside the prefix-aware scan.
+  auto pf_a = TestFrontier{{
+      {.cost = 1.0, .required = {1, 2, 3}, .enode_id = ENodeId{0}},  // P0
+      {.cost = 2.0, .required = {1, 2}, .enode_id = ENodeId{1}},     // P1 (evicted by Q)
+      {.cost = 3.0, .required = {4}, .enode_id = ENodeId{2}},        // P2
+  }};
+  auto pf_b = TestFrontier{{{.cost = 2.0, .required = {1}, .enode_id = ENodeId{3}}}};  // Q dominates P1
+  pf_a.merge_in_place(std::move(pf_b));
+  auto survivors = pf_a.alts();
+  ASSERT_EQ(survivors.size(), 3);
+  auto ids = std::set<ENodeId>{};
+  for (auto const &alt : survivors) ids.insert(alt.enode_id);
+  EXPECT_EQ(ids, (std::set<ENodeId>{ENodeId{0}, ENodeId{2}, ENodeId{3}})) << "P1 (id 1) evicted, P0/P2/Q kept";
+}
+
+TEST(ParetoFrontier_MergeInPlace, MixedIncomingAlts) {
+  // PF_A holds two incomparable survivors P0, P1.  PF_B contributes three alts
+  // (all mutually incomparable, so they survive PF_B's own prune): Q0 dominates
+  // P1, Q1 is incomparable to everything, Q2 is dominated by P0.  After merge the
+  // frontier is {P0, Q0, Q1}: P1 evicted by Q0, Q2 dropped by P0.
+  auto pf_a = TestFrontier{{
+      {.cost = 2.0, .required = {1, 2}, .enode_id = ENodeId{0}},  // P0
+      {.cost = 4.0, .required = {}, .enode_id = ENodeId{1}},      // P1 (evicted by Q0)
+  }};
+  auto pf_b = TestFrontier{{
+      {.cost = 3.0, .required = {}, .enode_id = ENodeId{2}},         // Q0 dominates P1
+      {.cost = 1.0, .required = {1, 2, 3}, .enode_id = ENodeId{3}},  // Q1 incomparable, survives
+      {.cost = 2.0, .required = {1, 2, 9}, .enode_id = ENodeId{4}},  // Q2 dominated by P0
+  }};
+  ASSERT_EQ(pf_b.alts().size(), 3) << "PF_B's three alts are mutually incomparable";
+  pf_a.merge_in_place(std::move(pf_b));
+  auto survivors = pf_a.alts();
+  ASSERT_EQ(survivors.size(), 3);
+  auto ids = std::set<ENodeId>{};
+  for (auto const &alt : survivors) ids.insert(alt.enode_id);
+  EXPECT_EQ(ids, (std::set<ENodeId>{ENodeId{0}, ENodeId{2}, ENodeId{3}})) << "P1 and Q2 removed";
+}
 
 TEST(ParetoFrontier_MergeInPlace, CrossDominatedElementsRemoved) {
   // PF_A has one cheap self-contained alt.  PF_B has two alts, both dominated

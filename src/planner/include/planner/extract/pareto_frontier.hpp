@@ -401,47 +401,44 @@ struct ParetoFrontier {
   /// other; the sweep starts at `pruned_prefix`.  Used by `merge_in_place`,
   /// where `*this` is known pruned before the suffix is appended.  Other
   /// public ops pass 0 (the default).
-  // Compact survivors `alts_[first, last)` down to `kept`, returning the new
-  // kept count.  Used to retain the untested tail of survivors when a candidate
-  // has been dominated and the scan stops early.
-  size_t retain_survivors(size_t kept, size_t first, size_t last) {
-    for (size_t k = first; k < last; ++k) {
-      if (kept != k) alts_[kept] = std::move(alts_[k]);
-      ++kept;
-    }
-    return kept;
-  }
-
   void prune(size_t pruned_prefix = 0) {
     auto const n = alts_.size();
     if (n < 2 || n <= pruned_prefix) return;
-    size_t write = pruned_prefix;
+    // `alts_[0, survivors)` are the survivors found so far.  Each candidate
+    // round rebuilds that region in place: `kept` counts the survivors retained
+    // so far this round (and is the next slot to write one into, the region
+    // starting at index 0).  The gap `j - kept` is the running eviction count.
+    size_t survivors = pruned_prefix;
     for (size_t read = pruned_prefix; read < n; ++read) {
       auto candidate = std::move(alts_[read]);
-      bool dominated = false;
+      bool candidate_dominated = false;
       size_t kept = 0;
-      for (size_t j = 0; j < write; ++j) {
-        auto const cmp = dominance_compare<Dims...>(alts_[j], candidate);
+      for (size_t j = 0; j < survivors; ++j) {
+        auto const &incumbent = alts_[j];
+        auto const cmp = dominance_compare<Dims...>(incumbent, candidate);
         if (cmp == std::partial_ordering::greater || cmp == std::partial_ordering::equivalent) {
-          // Survivor dominates or ties candidate: drop candidate, retain
-          // remaining survivors (transitivity guarantees candidate can no
-          // longer dominate any of them).
-          kept = retain_survivors(kept, j, write);
-          dominated = true;
+          // Incumbent dominates or ties the candidate, so the candidate is out.
+          // No earlier incumbent was evicted: the candidate could only evict an
+          // incumbent it dominates, but this incumbent dominates the candidate,
+          // so transitivity would make those two incumbents comparable -
+          // impossible among survivors.  Hence kept == j and the tail
+          // [j, survivors) is untouched, so every incumbent is kept as-is.
+          kept = survivors;
+          candidate_dominated = true;
           break;
         }
         if (cmp == std::partial_ordering::less) {
-          // Candidate dominates this survivor: drop it (skip writing).
+          // Candidate dominates this incumbent: drop it (skip writing).
           continue;
         }
-        // Unordered: survivor stays.
+        // Unordered: incumbent stays.  Compact it down past any evicted holes.
         if (kept != j) alts_[kept] = std::move(alts_[j]);
         ++kept;
       }
-      write = kept;
-      if (!dominated) alts_[write++] = std::move(candidate);
+      survivors = kept;
+      if (!candidate_dominated) alts_[survivors++] = std::move(candidate);
     }
-    alts_.resize(write);
+    alts_.resize(survivors);
   }
 };
 
