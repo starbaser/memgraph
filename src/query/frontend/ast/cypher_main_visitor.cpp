@@ -188,8 +188,12 @@ antlrcpp::Any CypherMainVisitor::visitSystemInfoQuery(MemgraphCypher::SystemInfo
   query_ = info_query;
   if (ctx->storageInfo()) {
     info_query->info_type_ = SystemInfoQuery::InfoType::STORAGE;
-    if (ctx->storageInfo()->db) {
-      info_query->database_ = std::any_cast<std::string>(ctx->storageInfo()->db->accept(this));
+    if (ctx->storageInfo()->ON()) {
+      if (ctx->storageInfo()->db) {
+        info_query->database_ = std::any_cast<std::string>(ctx->storageInfo()->db->accept(this));
+      } else if (ctx->storageInfo()->CURRENT()) {
+        info_query->is_current_database_ = true;
+      }
     }
     return info_query;
   }
@@ -2704,6 +2708,7 @@ antlrcpp::Any CypherMainVisitor::visitPrivilege(MemgraphCypher::PrivilegeContext
   if (ctx->PROFILE_RESTRICTION()) return AuthQuery::Privilege::PROFILE_RESTRICTION;
   if (ctx->PARALLEL_EXECUTION()) return AuthQuery::Privilege::PARALLEL_EXECUTION;
   if (ctx->SERVER_SIDE_PARAMETERS()) return AuthQuery::Privilege::SERVER_SIDE_PARAMETERS;
+  if (ctx->RELOAD_TLS()) return AuthQuery::Privilege::RELOAD_TLS;
   LOG_FATAL("Should not get here - unknown privilege!");
 }
 
@@ -3968,6 +3973,14 @@ antlrcpp::Any CypherMainVisitor::visitFunctionInvocation(MemgraphCypher::Functio
       return static_cast<Expression *>(
           storage_->Create<Aggregation>(expressions[0], expressions[1], Aggregation::Op::PROJECT_LISTS, is_distinct));
     }
+    if (upper_function_name == Aggregation::kDerive) {
+      return static_cast<Expression *>(
+          storage_->Create<Aggregation>(expressions[0], expressions[1], Aggregation::Op::DERIVE, is_distinct));
+    }
+  }
+
+  if (upper_function_name == Aggregation::kDerive) {
+    throw SemanticException("derive() requires exactly 2 arguments: a path and an options map.");
   }
 
   auto *function_expr = storage_->Create<Function>(function_name, expressions);
@@ -4419,8 +4432,13 @@ antlrcpp::Any CypherMainVisitor::visitShowSchemaInfoQuery(MemgraphCypher::ShowSc
   return show_schema_info_query;
 }
 
-antlrcpp::Any CypherMainVisitor::visitReloadSSLQuery(MemgraphCypher::ReloadSSLQueryContext * /*ctx*/) {
+antlrcpp::Any CypherMainVisitor::visitReloadSSLQuery(MemgraphCypher::ReloadSSLQueryContext *ctx) {
   auto *reload_ssl_query = storage_->Create<ReloadSSLQuery>();
+  if (ctx->INTRA_CLUSTER()) {
+    reload_ssl_query->type_ = ReloadSSLQuery::Type::INTRA_CLUSTER;
+  } else {
+    reload_ssl_query->type_ = ReloadSSLQuery::Type::BOLT_SERVER;
+  }
   query_ = reload_ssl_query;
   return reload_ssl_query;
 }

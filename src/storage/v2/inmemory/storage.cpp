@@ -315,7 +315,9 @@ InMemoryStorage::InMemoryStorage(Config config, std::optional<free_mem_fn> free_
       db_arena_(db_arena),
       vertices_{},
       edges_{},
-      edges_metadata_{},
+      edges_metadata_index_{(config.salient.items.properties_on_edges && config.salient.items.enable_edges_metadata)
+                                ? std::optional<EdgeMetadataIndex>{std::in_place}
+                                : std::nullopt},
       recovery_{.snapshot_directory_ = config.durability.storage_directory / durability::kSnapshotDirectory,
                 .wal_directory_ = config.durability.storage_directory / durability::kWalDirectory},
       lock_file_path_(config.durability.storage_directory / durability::kLockFile),
@@ -361,7 +363,7 @@ InMemoryStorage::InMemoryStorage(Config config, std::optional<free_mem_fn> free_
         repl_storage_state_,
         &vertices_,
         &edges_,
-        &edges_metadata_,
+        edges_metadata_index_ ? &*edges_metadata_index_ : nullptr,
         &edge_count_,
         name_id_mapper_.get(),
         &indices_,
@@ -449,7 +451,9 @@ InMemoryStorage::InMemoryStorage(Config config, std::optional<free_mem_fn> free_
       static_cast<InMemoryUniqueConstraints *>(constraints_.unique_constraints_.get())->RunGC();
 
       // SkipList is already threadsafe
-      edges_metadata_.run_gc();
+      if (edges_metadata_index_) {
+        edges_metadata_index_->RunGc();
+      }
       vertices_.run_gc();
       edges_.run_gc();
 
@@ -683,7 +687,6 @@ Result<EdgeAccessor> InMemoryStorage::InMemoryAccessor::CreateEdge(VertexAccesso
   // It's important to destruct accessors after we unlock the vertices to avoid expensive skip list gc while we hold the
   // locks
   std::optional<utils::SkipListDb<Edge>::Accessor> edge_acc;
-  std::optional<utils::SkipListDb<EdgeMetadata>::Accessor> edge_metadata_acc;
 
   auto *from_vertex = from->vertex_;
   auto *to_vertex = to->vertex_;
@@ -738,10 +741,8 @@ Result<EdgeAccessor> InMemoryStorage::InMemoryAccessor::CreateEdge(VertexAccesso
     if (delta) {
       delta->prev.Set(&*it);
     }
-    if (config_.enable_edges_metadata) {
-      edge_metadata_acc = mem_storage->edges_metadata_.access();
-      auto [_, inserted] = edge_metadata_acc->insert(EdgeMetadata(gid, from->vertex_));
-      MG_ASSERT(inserted, "The edge must be inserted here!");
+    if (auto &idx = mem_storage->edges_metadata_index_) {
+      idx->OnEdgeCreated(gid, from->vertex_);
     }
   }
 
@@ -810,7 +811,6 @@ Result<EdgeAccessor> InMemoryStorage::InMemoryAccessor::CreateEdgeEx(VertexAcces
   // It's important to destruct accessors after we unlock the vertices to avoid expensive skip list gc while we hold the
   // locks
   std::optional<utils::SkipListDb<Edge>::Accessor> edge_acc;
-  std::optional<utils::SkipListDb<EdgeMetadata>::Accessor> edge_metadata_acc;
 
   auto *from_vertex = from->vertex_;
   auto *to_vertex = to->vertex_;
@@ -870,10 +870,8 @@ Result<EdgeAccessor> InMemoryStorage::InMemoryAccessor::CreateEdgeEx(VertexAcces
     if (delta) {
       delta->prev.Set(&*it);
     }
-    if (config_.enable_edges_metadata) {
-      edge_metadata_acc = mem_storage->edges_metadata_.access();
-      auto [_, inserted] = edge_metadata_acc->insert(EdgeMetadata(gid, from->vertex_));
-      MG_ASSERT(inserted, "The edge must be inserted here!");
+    if (auto &idx = mem_storage->edges_metadata_index_) {
+      idx->OnEdgeCreated(gid, from->vertex_);
     }
   }
 
@@ -903,15 +901,6 @@ Result<EdgeAccessor> InMemoryStorage::InMemoryAccessor::CreateEdgeEx(VertexAcces
   });
 
   return EdgeAccessor(edge, edge_type, from_vertex, to_vertex, storage_, &transaction_);
-}
-
-void InMemoryStorage::UpdateEdgesMetadataOnModification(Edge *edge, Vertex *from_vertex) {
-  auto edge_metadata_acc = edges_metadata_.access();
-  auto edge_to_modify = edge_metadata_acc.find(edge->gid);
-  if (edge_to_modify == edge_metadata_acc.end()) {
-    throw utils::BasicException("Invalid transaction! Please raise an issue, {}:{}", __FILE__, __LINE__);
-  }
-  edge_to_modify->from_vertex = from_vertex;
 }
 
 std::expected<void, ConstraintViolation> InMemoryStorage::InMemoryAccessor::ExistenceConstraintsViolation() const {
@@ -1688,10 +1677,9 @@ void InMemoryStorage::InMemoryAccessor::Abort() {
                                   transaction_.start_timestamp,
                                   mem_storage->name_id_mapper_.get());
     // EDGES METADATA (has ptr to Vertices, must be before removing verticies)
-    if (!my_deleted_edges.empty() && mem_storage->config_.salient.items.enable_edges_metadata) {
-      auto edges_metadata_acc = mem_storage->edges_metadata_.access();
-      for (auto gid : my_deleted_edges) {
-        edges_metadata_acc.remove(gid);
+    if (!my_deleted_edges.empty()) {
+      if (auto &idx = mem_storage->edges_metadata_index_) {
+        idx->OnEdgesDeleted(my_deleted_edges);
       }
     }
 
@@ -2741,6 +2729,14 @@ Transaction InMemoryStorage::CreateTransaction(IsolationLevel isolation_level, S
 }
 
 void InMemoryStorage::SetStorageMode(StorageMode new_storage_mode) {
+  // Drain before UNIQUE: worker holds AsyncIndexer::mutex_ while waiting on
+  // main_lock_, so draining under UNIQUE would deadlock.
+  if (new_storage_mode == StorageMode::IN_MEMORY_ANALYTICAL && storage_mode_ == StorageMode::IN_MEMORY_TRANSACTIONAL) {
+    spdlog::info("SetStorageMode: draining async indexer before transition to IN_MEMORY_ANALYTICAL");
+    async_indexer_.CompleteRemaining();
+    spdlog::info("SetStorageMode: async indexer drained");
+  }
+
   auto unique_accessor = UniqueAccess();
   MG_ASSERT(
       (storage_mode_ == StorageMode::IN_MEMORY_ANALYTICAL || storage_mode_ == StorageMode::IN_MEMORY_TRANSACTIONAL) &&
@@ -2756,8 +2752,13 @@ void InMemoryStorage::SetStorageMode(StorageMode new_storage_mode) {
             "Constraints are not supported in analytical storage mode. Please drop them before "
             "changing storage mode to analytical or use transactional mode.");
       }
-      // Ensure all pending work has been completed before changing to IN_MEMORY_ANALYTICAL
-      async_indexer_.CompleteRemaining();
+      // Anything enqueued in the gap between drain and UNIQUE can't be drained here without deadlock.
+      if (!async_indexer_.IsIdle()) {
+        throw utils::BasicException(
+            "Cannot switch to IN_MEMORY_ANALYTICAL: an async index creation task (from CREATE INDEX "
+            "or ENABLE TTL) was enqueued concurrently with the storage mode change. Wait for pending "
+            "index creation to finish and retry.");
+      }
       snapshot_runner_.Pause();
     } else {
       // No need to resume async indexer, it is always running.
@@ -3211,10 +3212,9 @@ void InMemoryStorage::CollectGarbage(std::unique_lock<utils::ResourceLock> main_
   }
 
   // EDGES METADATA (has ptr to Vertices, must be before removing vertices)
-  if (!current_deleted_edges.empty() && config_.salient.items.enable_edges_metadata) {
-    auto edge_metadata_acc = edges_metadata_.access();
-    for (auto edge : current_deleted_edges) {
-      MG_ASSERT(edge_metadata_acc.remove(edge), "Invalid database state!");
+  if (!current_deleted_edges.empty()) {
+    if (auto &idx = edges_metadata_index_) {
+      idx->OnEdgesDeleted(current_deleted_edges);
     }
   }
 
@@ -3324,11 +3324,11 @@ void InMemoryStorage::CollectGarbage(std::unique_lock<utils::ResourceLock> main_
       }
     }
 
-    auto edge_metadata_acc = edges_metadata_.access();
+    auto *idx = edges_metadata_index_ ? &*edges_metadata_index_ : nullptr;
     for (auto &edge : edge_acc) {
       if (edge.delta() == nullptr && edge.deleted()) {
+        if (idx) idx->OnEdgeDeleted(edge.gid);
         edge_acc.remove(edge);
-        edge_metadata_acc.remove(edge.gid);
       }
     }
   }
@@ -3343,9 +3343,7 @@ StorageInfo InMemoryStorage::GetBaseInfo() {
     info.average_degree = 2.0 * static_cast<double>(info.edge_count) / info.vertex_count;
   }
   info.memory_res = utils::GetMemoryRES();
-  metrics::Metrics().global.peak_memory_res_bytes->Set(
-      std::max(static_cast<double>(info.memory_res), metrics::Metrics().global.peak_memory_res_bytes->Value()));
-  info.peak_memory_res = static_cast<uint64_t>(metrics::Metrics().global.peak_memory_res_bytes->Value());
+  info.peak_memory_res = metrics::Metrics().UpdateAndGetPeakMemoryRes(info.memory_res);
   info.unreleased_delta_objects = static_cast<uint64_t>(metric_handles_.unreleased_delta_objects.Value());
 
   // Special case for the default database
@@ -4159,7 +4157,7 @@ std::expected<void, InMemoryStorage::RecoverSnapshotError> InMemoryStorage::Reco
         storage::durability::LoadSnapshot(local_path,
                                           &vertices_,
                                           &edges_,
-                                          &edges_metadata_,
+                                          edges_metadata_index_ ? &*edges_metadata_index_ : nullptr,
                                           &repl_storage_state_.history,
                                           name_id_mapper_.get(),
                                           &edge_count_,
@@ -4189,16 +4187,18 @@ std::expected<void, InMemoryStorage::RecoverSnapshotError> InMemoryStorage::Reco
     // We are the only active transaction, so mark everything up to the next timestamp
     if (timestamp_ > 0) commit_log_->MarkFinishedInRange(0, timestamp_ - 1);
 
-    spdlog::trace("Recovering indices and constraints from snapshot.");
-    storage::durability::RecoverIndicesStatsAndConstraints(&vertices_,
-                                                           name_id_mapper_.get(),
-                                                           &indices_,
-                                                           &constraints_,
-                                                           config_,
-                                                           recovery_info,
-                                                           db_arena_,
-                                                           recovered_snapshot.indices_constraints,
-                                                           config_.salient.items.properties_on_edges);
+    spdlog::trace("Recovering derived state from snapshot.");
+    storage::durability::RecoverDerivedState(&vertices_,
+                                             &edges_,
+                                             name_id_mapper_.get(),
+                                             &indices_,
+                                             &constraints_,
+                                             config_,
+                                             recovery_info,
+                                             db_arena_,
+                                             recovered_snapshot.indices_constraints,
+                                             edges_metadata_index_ ? &*edges_metadata_index_ : nullptr,
+                                             config_.salient.items.properties_on_edges);
     spdlog::trace("Successfully recovered from snapshot {}", local_path);
 
     // Destroying current wal file
@@ -4466,25 +4466,21 @@ EdgeInfo ExtractEdgeInfo(Vertex *from_vertex, const Edge *edge_ptr) {
   return std::nullopt;
 }
 
-EdgeInfo InMemoryStorage::FindEdgeFromMetadata(Gid gid, const Edge *edge_ptr) {
-  auto edge_metadata_acc = edges_metadata_.access();
-  auto edge_metadata_it = edge_metadata_acc.find(gid);
-  MG_ASSERT(edge_metadata_it != edge_metadata_acc.end(), "Invalid database state!");
-  return ExtractEdgeInfo(edge_metadata_it->from_vertex, edge_ptr);
-}
-
-EdgeInfo InMemoryStorage::FindEdge(Gid gid) {
+EdgeInfo InMemoryStorage::FindEdge(Gid edge_gid) {
   auto edge_acc = edges_.access();
-  auto edge_it = edge_acc.find(gid);
+  auto edge_it = edge_acc.find(edge_gid);
   if (edge_it == edge_acc.end()) {
     return std::nullopt;
   }
 
   auto *edge_ptr = &(*edge_it);
 
+  // Pin vertices_ for the duration of the ExtractEdgeInfo scan. The Vertex*
+  // returned by the index points into this skip list; without the accessor,
+  // GC could reclaim the node mid-scan.
   auto vertices_acc = vertices_.access();
-  if (config_.salient.items.enable_edges_metadata) {
-    return FindEdgeFromMetadata(gid, edge_ptr);
+  if (edges_metadata_index_) {
+    return ExtractEdgeInfo(edges_metadata_index_->FromVertexOf(edge_gid), edge_ptr);
   }
 
   for (auto &from_vertex : vertices_acc) {
@@ -4504,9 +4500,10 @@ EdgeInfo InMemoryStorage::FindEdge(Gid edge_gid, Gid from_vertex_gid) {
 
   auto *edge_ptr = &(*edge_it);
 
+  // Pin vertices_ for ExtractEdgeInfo (see FindEdge(Gid) above).
   auto vertices_acc = vertices_.access();
-  if (config_.salient.items.enable_edges_metadata) {
-    return FindEdgeFromMetadata(edge_gid, edge_ptr);
+  if (edges_metadata_index_) {
+    return ExtractEdgeInfo(edges_metadata_index_->FromVertexOf(edge_gid), edge_ptr);
   }
 
   auto vertex_it = vertices_acc.find(from_vertex_gid);
@@ -4569,8 +4566,10 @@ void InMemoryStorage::Clear() {
   indices_.DropGraphClearIndices();
   constraints_.DropGraphClearConstraints();
 
-  edges_metadata_.clear();
-  edges_metadata_.run_gc();
+  if (edges_metadata_index_) {
+    edges_metadata_index_->Clear();
+    edges_metadata_index_->RunGc();
+  }
   stored_node_labels_.clear();
   stored_edge_types_.clear();
 
